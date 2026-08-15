@@ -1,0 +1,13 @@
+# Build artifacts
+build/
+build32/
+
+# Hand-installed third-party dependencies (not part of this repo;
+# see CLAUDE.md for sources/versions)
+libs/
+
+# IDE / user files
+.vs/
+*.user
+# Stray editor backups
+*.copy
