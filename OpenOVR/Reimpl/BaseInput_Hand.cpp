@@ -289,7 +289,9 @@ static void InterpolateBone(VRBoneTransform_t& bone, const VRBoneTransform_t& ta
 	bone.orientation = { resRot.w, resRot.x, resRot.y, resRot.z };
 }
 
-static auto GetInterpolatedControllerState(const ITrackedDevice::TrackedDeviceType hand, const LegacyControllerActions controller) {
+// Taken by reference: LegacyControllerActions holds a std::string, and this is called on the
+// per-frame skeletal path - passing it by value copied that string every call.
+static auto GetInterpolatedControllerState(const ITrackedDevice::TrackedDeviceType hand, const LegacyControllerActions& controller) {
 	struct ControllerState {
 		float triggerPct;
 		float gripPct;

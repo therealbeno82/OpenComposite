@@ -30,6 +30,7 @@ XrExt::XrExt(XrGraphicsApiSupportedFlags apis, const std::vector<const char*>& e
 	bool hasVisMask = false;
 	bool hasHandTracking = false;
 	bool xdevSpace = false;
+	bool hasDisplayRefreshRate = false;
 	for (const char* ext : extensions) {
 		if (strcmp(ext, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0)
 			hasVisMask = true;
@@ -39,6 +40,8 @@ XrExt::XrExt(XrGraphicsApiSupportedFlags apis, const std::vector<const char*>& e
 			supportsG2Controller = true;
 		if (strcmp(ext, XR_MNDX_XDEV_SPACE_EXTENSION_NAME) == 0)
 			xdevSpace = true;
+		if (strcmp(ext, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0)
+			hasDisplayRefreshRate = true;
 	}
 
 #define XR_BIND(name, function) OOVR_FAILED_XR_ABORT(xrGetInstanceProcAddr(xr_instance, #name, (PFN_xrVoidFunction*)&this->function))
@@ -46,6 +49,10 @@ XrExt::XrExt(XrGraphicsApiSupportedFlags apis, const std::vector<const char*>& e
 
 	if (hasVisMask)
 		XR_BIND_OPT(xrGetVisibilityMaskKHR, pfnXrGetVisibilityMaskKHR);
+
+	// Optional: not every runtime has it, and everything that uses it falls back gracefully.
+	if (hasDisplayRefreshRate)
+		XR_BIND_OPT(xrGetDisplayRefreshRateFB, pfnXrGetDisplayRefreshRateFB);
 
 	if (hasHandTracking) {
 		XR_BIND(xrCreateHandTrackerEXT, pfnXrCreateHandTrackerExt);
@@ -123,6 +130,24 @@ XrSessionGlobals::XrSessionGlobals()
 	OOVR_FAILED_XR_ABORT(xrGetSystemProperties(xr_instance, xr_system, &systemProperties));
 }
 
+float XrSessionGlobals::GetDisplayFrequency(float fallback) const
+{
+	// Ask the runtime directly if it can tell us. This works from session creation onwards, unlike
+	// the frame-period route below, and it tracks a refresh change mid-session.
+	if (xr_ext && xr_ext->xrGetDisplayRefreshRateFB_Available() && xr_session.get() != XR_NULL_HANDLE) {
+		float hz = 0.0f;
+		XrResult res = xr_ext->xrGetDisplayRefreshRateFB(xr_session.get(), &hz);
+		if (XR_SUCCEEDED(res) && hz > 0.0f)
+			return hz;
+	}
+
+	// Otherwise derive it from the last frame's predicted period - only valid after a frame.
+	if (predictedDisplayPeriod > 0)
+		return 1.0e9f / (float)predictedDisplayPeriod;
+
+	return fallback;
+}
+
 XrTime XrSessionGlobals::GetBestTime()
 {
 	return nextPredictedFrameTime > 1 ? nextPredictedFrameTime : latestTime;
@@ -130,11 +155,17 @@ XrTime XrSessionGlobals::GetBestTime()
 
 XruCachedViews XrSessionGlobals::GetCachedViews(XrSpace space)
 {
-	std::lock_guard lock(cachedViewsMtx);
-	auto it = cachedViews.find(space);
-	if (it != cachedViews.end()) {
-		return it->second;
+	// Fast path: a cache hit only reads the map, so several threads can do it at once.
+	{
+		std::shared_lock lock(cachedViewsMtx);
+		auto it = cachedViews.find(space);
+		if (it != cachedViews.end()) {
+			return it->second;
+		}
 	}
+
+	// Miss. The lock is deliberately released for the xrLocateViews call below - it's the expensive
+	// part, and holding a lock across a runtime call would serialise every reader behind it.
 
 	XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
 	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -157,16 +188,23 @@ XruCachedViews XrSessionGlobals::GetCachedViews(XrSpace space)
 		return failed;
 	}
 
-	XruCachedViews& cws = cachedViews[space];
-	cws.viewState = viewState;
-	cws.viewCount = viewCount;
-	std::copy(views, views + XruEyeCount, cws.views.begin());
-	return cws;
+	// Inserting mutates the map (and can rehash it), so this must be the exclusive lock - a
+	// shared_lock here would let two threads on a cache miss corrupt the map. Another thread may
+	// have raced us to fill this entry while we were in xrLocateViews; its data is a lookup for the
+	// same space at the same display time, so take it rather than overwriting.
+	std::unique_lock lock(cachedViewsMtx);
+	auto [it, inserted] = cachedViews.try_emplace(space);
+	if (inserted) {
+		it->second.viewState = viewState;
+		it->second.viewCount = viewCount;
+		std::copy(views, views + XruEyeCount, it->second.views.begin());
+	}
+	return it->second;
 }
 
 void XrSessionGlobals::ClearCachedViews()
 {
-	std::lock_guard lock(cachedViewsMtx);
+	std::unique_lock lock(cachedViewsMtx);
 	cachedViews.clear();
 }
 

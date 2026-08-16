@@ -141,6 +141,17 @@ void oovr_message_raw(const char* message, const char* title);
 // strcpy_s more convenient on arrays in a cross-platform way.
 #define strcpy_arr(dest, src) strcpy_s(dest, sizeof(dest), src)
 
+/**
+ * Copy that truncates instead of failing when the source doesn't fit, logging once per site.
+ *
+ * strcpy_s (and therefore strcpy_arr) invokes the MSVC invalid-parameter handler on overflow,
+ * which terminates the process. That's fine for names we build ourselves, but not for anything
+ * derived from a game's action manifest or binding JSON - those are arbitrary strings, and an
+ * over-long one should cost us a mis-named action, not the whole session.
+ */
+void oovr_strcpy_trunc(char* dest, size_t destSize, const char* src, const char* what);
+#define strcpy_arr_trunc(dest, src, what) oovr_strcpy_trunc(dest, sizeof(dest), src, what)
+
 #define STUBBED()                                                                                                            \
 	do {                                                                                                                     \
 		std::string str = "Hit stubbed file at " __FILE__ ":" + std::to_string(__LINE__) + " func " + std::string(__func__); \

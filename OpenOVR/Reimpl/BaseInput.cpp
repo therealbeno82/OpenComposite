@@ -202,6 +202,23 @@ static std::string pathFromParts(const std::initializer_list<std::string>& parts
 	return str;
 }
 
+/**
+ * Remove every occurrence of needle from str, if any.
+ *
+ * The obvious `str.replace(str.find(needle), needle.size(), "")` throws std::out_of_range when the
+ * needle isn't present, because find returns npos. The strings this is used on come straight out
+ * of a game's binding JSON - a path that isn't under /user/hand/ is perfectly legal and used to
+ * throw an exception out through the OpenVR C ABI and into the game.
+ */
+static void eraseAll(std::string& str, const std::string& needle)
+{
+	if (needle.empty())
+		return;
+
+	for (size_t pos = str.find(needle); pos != std::string::npos; pos = str.find(needle, pos))
+		str.erase(pos, needle.size());
+}
+
 // Must be defined non-inline to avoid it ending up in stubs.gen.cpp
 BaseInput::Action::~Action() = default;
 BaseInput::ActionSource::~ActionSource() = default;
@@ -343,9 +360,17 @@ BaseInput::BaseInput()
 }
 BaseInput::~BaseInput()
 {
+	ReleaseSessionHandles();
+}
+
+void BaseInput::ReleaseSessionHandles()
+{
 	for (XrHandTrackerEXT& handTracker : handTrackers) {
-		if (handTracker != XR_NULL_HANDLE)
-			xr_ext->xrDestroyHandTrackerEXT(handTracker);
+		if (handTracker != XR_NULL_HANDLE) {
+			XrResult res = xr_ext->xrDestroyHandTrackerEXT(handTracker);
+			if (XR_FAILED(res))
+				OOVR_LOGF("xrDestroyHandTrackerEXT failed (%d) - continuing with shutdown", res);
+		}
 		handTracker = XR_NULL_HANDLE;
 	}
 }
@@ -387,6 +412,10 @@ EVRInputError BaseInput::SetActionManifestPath(const char* pchActionManifestPath
 		actions.Reset();
 		actionSets.Reset();
 		DpadBindingInfo::parents.clear();
+		// Same reason as DpadBindingInfo::parents above: these cache XrActions belonging to the
+		// action sets we just destroyed. Left in place, LoadBindingsSet would find the stale entry
+		// and hand a dead handle to xrSuggestInteractionProfileBindings on the reload.
+		indexGripExtensionActions.clear();
 		usingLegacyInput = false;
 	}
 
@@ -553,9 +582,11 @@ EVRInputError BaseInput::SetActionManifestPath(const char* pchActionManifestPath
 
 	for (const std::unique_ptr<ActionSet>& as : actionSets.GetItems()) {
 		XrActionSetCreateInfo createInfo = { XR_TYPE_ACTION_SET_CREATE_INFO };
+		// escapePathString can *grow* the string (uppercase becomes two chars, non-ASCII three), so
+		// a name the registry already trimmed to fit can still overflow these buffers.
 		std::string safeName = escapePathString(as->name);
-		strcpy_arr(createInfo.actionSetName, safeName.c_str());
-		strcpy_arr(createInfo.localizedActionSetName, as->name.c_str()); // TODO localisation
+		strcpy_arr_trunc(createInfo.actionSetName, safeName.c_str(), "action set name");
+		strcpy_arr_trunc(createInfo.localizedActionSetName, as->name.c_str(), "action set name"); // TODO localisation
 
 		OOVR_FAILED_XR_ABORT(xrCreateActionSet(xr_instance, &createInfo, &as->xr));
 	}
@@ -563,8 +594,8 @@ EVRInputError BaseInput::SetActionManifestPath(const char* pchActionManifestPath
 	for (const std::unique_ptr<Action>& act : actions.GetItems()) {
 		XrActionCreateInfo info = { XR_TYPE_ACTION_CREATE_INFO };
 		std::string safeName = escapePathString(act->shortName);
-		strcpy_arr(info.actionName, safeName.c_str());
-		strcpy_arr(info.localizedActionName, act->shortName.c_str()); // TODO localisation
+		strcpy_arr_trunc(info.actionName, safeName.c_str(), "action name");
+		strcpy_arr_trunc(info.localizedActionName, act->shortName.c_str(), "action name"); // TODO localisation
 
 		switch (act->type) {
 		case ActionType::Boolean:
@@ -883,9 +914,9 @@ void BaseInput::LoadBindingsSet(const InteractionProfile& profile, const std::st
 						info.subactionPaths = allSubactionPaths.data();
 						info.countSubactionPaths = allSubactionPaths.size();
 						std::string extends_name = forceActionKey + "-grip-force-extra";
-						strcpy_arr(info.actionName, extends_name.c_str());
+						strcpy_arr_trunc(info.actionName, extends_name.c_str(), "grip force action name");
 						info.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
-						strcpy_arr(info.localizedActionName, extends_name.c_str());
+						strcpy_arr_trunc(info.localizedActionName, extends_name.c_str(), "grip force action name");
 						OOVR_FAILED_XR_ABORT(xrCreateAction(action->set->xr, &info, &forceAction));
 
 						indexGripExtensionActions[forceActionKey] = forceAction;
@@ -1075,7 +1106,7 @@ void BaseInput::LoadDpadAction(const InteractionProfile& profile, const std::str
 	std::string end = path.substr(path.rfind("/") + 1);
 	std::string parentName = importBasePath + "-" + end + "-dpad-parent";
 	for (const auto& str : to_delete) {
-		parentName.replace(parentName.find(str), str.size(), "");
+		eraseAll(parentName, str);
 	}
 
 	XrActionCreateInfo info{ XR_TYPE_ACTION_CREATE_INFO };
@@ -1090,9 +1121,9 @@ void BaseInput::LoadDpadAction(const InteractionProfile& profile, const std::str
 		parent_iter = DpadBindingInfo::parents.find(parentName);
 
 		// create action for getting parent data (i.e. trackpad location)
-		strcpy_arr(info.actionName, parentName.c_str());
+		strcpy_arr_trunc(info.actionName, parentName.c_str(), "dpad parent action name");
 		info.actionType = XR_ACTION_TYPE_VECTOR2F_INPUT;
-		strcpy_arr(info.localizedActionName, parentName.c_str()); // TODO localization
+		strcpy_arr_trunc(info.localizedActionName, parentName.c_str(), "dpad parent action name"); // TODO localization
 		OOVR_FAILED_XR_ABORT(xrCreateAction(action->set->xr, &info, &parent_iter->second.vectorAction));
 
 		// add parent to bindings
@@ -1172,12 +1203,12 @@ void BaseInput::LoadDClickAction(const InteractionProfile& profile, const std::s
 	std::string end = path.substr(path.rfind("/") + 1);
 	std::string clickName = importBasePath + "-" + end + "-double-click";
 	for (const auto& str : to_delete) {
-		clickName.replace(clickName.find(str), str.size(), "");
+		eraseAll(clickName, str);
 	}
 
 	info.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
-	strcpy_arr(info.actionName, clickName.c_str());
-	strcpy_arr(info.localizedActionName, clickName.c_str()); // TODO: localization
+	strcpy_arr_trunc(info.actionName, clickName.c_str(), "double-click action name");
+	strcpy_arr_trunc(info.localizedActionName, clickName.c_str(), "double-click action name"); // TODO: localization
 	OOVR_FAILED_XR_ABORT(xrCreateAction(action->set->xr, &info, &dclickInfo.click_action)); // FIXME: share click actions
 
 	XrPath suggested_path;
@@ -1324,12 +1355,29 @@ EVRInputError BaseInput::UpdateActionState(VR_ARRAY_COUNT(unSetCount) VRActiveAc
 		}
 	}
 
-	std::vector<XrActiveActionSet> aas(unSetCount + 1);
+	// Reuse a member buffer on the per-frame path rather than allocating every frame; fall back to
+	// the heap if a game hands us more action sets than the buffer holds. Widen before adding the
+	// legacy set's slot - unSetCount is uint32_t, so `unSetCount + 1` alone would wrap.
+	const size_t totalSets = static_cast<size_t>(unSetCount) + 1;
+	std::vector<XrActiveActionSet> heapBuffer;
+	XrActiveActionSet* aas;
+	if (totalSets <= activeActionSetBuffer.size()) {
+		aas = activeActionSetBuffer.data();
+	} else {
+		heapBuffer.resize(totalSets);
+		aas = heapBuffer.data();
+	}
 
 	for (uint32_t i = 0; i < unSetCount; i++) {
 		VRActiveActionSet_t& set = pSets[i];
 
 		GET_ACTION_SET_FROM_HANDLE(as, set.ulActionSet);
+
+		// The buffer is a member now, so it holds last frame's contents rather than being
+		// freshly zeroed like the vector this replaced. subactionPath below is only written
+		// conditionally - without clearing the slot first, a set that was restricted to one hand
+		// on an earlier frame stays restricted forever.
+		aas[i] = {};
 		aas[i].actionSet = as->xr;
 
 		if (set.ulRestrictedToDevice != vr::k_ulInvalidInputValueHandle) {
@@ -1343,12 +1391,14 @@ EVRInputError BaseInput::UpdateActionState(VR_ARRAY_COUNT(unSetCount) VRActiveAc
 		}
 	}
 
-	// Ad the last set, the legacy input set
-	aas.at(unSetCount).actionSet = legacyInputsSet;
+	// Ad the last set, the legacy input set. Cleared for the same reason as the loop above: if a
+	// previous frame passed more action sets, this slot holds that set's subactionPath.
+	aas[unSetCount] = {};
+	aas[unSetCount].actionSet = legacyInputsSet;
 
 	XrActionsSyncInfo syncInfo = { XR_TYPE_ACTIONS_SYNC_INFO };
-	syncInfo.activeActionSets = aas.data();
-	syncInfo.countActiveActionSets = aas.size();
+	syncInfo.activeActionSets = aas;
+	syncInfo.countActiveActionSets = static_cast<uint32_t>(totalSets);
 	OOVR_FAILED_XR_ABORT(xrSyncActions(xr_session.get(), &syncInfo));
 	syncSerial++;
 
@@ -2170,6 +2220,14 @@ EVRInputError BaseInput::GetSkeletalSummaryData(VRActionHandle_t actionHandle, E
 
 	ZeroMemory(pSkeletalSummaryData, sizeof(VRSkeletalSummaryData_t));
 
+	// skeletalHand is HAND_NONE for any action that isn't a skeleton action, and a game is free to
+	// pass such a handle here. Both summary implementations index per-hand arrays with it -
+	// handTrackers[2] and legacyControllers - so this has to be rejected before either is called.
+	if (action->skeletalHand != ITrackedDevice::HAND_LEFT && action->skeletalHand != ITrackedDevice::HAND_RIGHT) {
+		OOVR_LOG_ONCE("WARNING: GetSkeletalSummaryData called with a non-skeletal action handle");
+		return vr::VRInputError_WrongType;
+	}
+
 	if (xr_gbl->handTrackingProperties.supportsHandTracking) {
 		return getRealSkeletalSummary(action->skeletalHand, pSkeletalSummaryData);
 	}
@@ -2179,6 +2237,14 @@ EVRInputError BaseInput::GetSkeletalSummaryData(VRActionHandle_t actionHandle, E
 
 EVRInputError BaseInput::getRealSkeletalSummary(ITrackedDevice::TrackedDeviceType hand, VRSkeletalSummaryData_t* pSkeletalSummaryData)
 {
+	// handTrackers only has entries for the two hands - callers must have filtered out HAND_NONE
+	// and GENERIC_TRACKER, or this indexes past the end of the array.
+	OOVR_FALSE_ABORT(hand == ITrackedDevice::HAND_LEFT || hand == ITrackedDevice::HAND_RIGHT);
+
+	// The runtime may support hand tracking while this session hasn't bound the trackers yet.
+	if (handTrackers[hand] == XR_NULL_HANDLE)
+		return getEstimatedSkeletalSummary(hand, pSkeletalSummaryData);
+
 	XrHandJointsLocateInfoEXT locateInfo = { XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT };
 	locateInfo.baseSpace = xr_gbl->floorSpace;
 	locateInfo.time = xr_gbl->GetBestTime();
@@ -2362,8 +2428,22 @@ EVRInputError BaseInput::GetActionOrigins(VRActionSetHandle_t actionSetHandle, V
 		uint32_t len;
 		OOVR_FAILED_XR_ABORT(xrPathToString(xr_instance, tmp[i], XR_MAX_PATH_LENGTH, &len, buff));
 
-		std::string path(buff, len);
-		int endOfHandPos = path.find('/', strlen("/user/hand/") + 1);
+		// xrPathToString reports a length that *includes* the null terminator - constructing the
+		// string with it would embed a '\0' and break every comparison below.
+		std::string path(buff, len > 0 ? len - 1 : 0);
+
+		// Trim to the /user/hand/<side> prefix. As the FIXME further down notes, a bound source
+		// path can be anything - it isn't guaranteed to have a /user/hand/ prefix, let alone a
+		// further '/' after it. This used to store find's result in an int, so npos became -1 and
+		// erase((size_t)-1) threw std::out_of_range out through the OpenVR C ABI.
+		const size_t handPrefixLen = strlen("/user/hand/");
+		if (path.size() <= handPrefixLen)
+			continue;
+
+		size_t endOfHandPos = path.find('/', handPrefixLen + 1);
+		if (endOfHandPos == std::string::npos)
+			continue;
+
 		path.erase(endOfHandPos);
 		sources.insert(std::move(path));
 	}
@@ -2497,20 +2577,36 @@ EVRInputError BaseInput::GetActionBindingInfo(VRActionHandle_t actionHandle, OOV
 		OOVR_FAILED_XR_ABORT(xrPathToString(xr_instance, path, 0, &pathLen, nullptr));
 		std::vector<char> chars(pathLen);
 		OOVR_FAILED_XR_ABORT(xrPathToString(xr_instance, path, chars.size(), &pathLen, chars.data()));
-		std::string pathStr(chars.data(), chars.size());
+		// pathLen counts the null terminator, so trim it rather than embedding a '\0' in the string.
+		std::string pathStr(chars.data(), chars.size() > 0 ? chars.size() - 1 : 0);
 
 		std::vector<std::string> parts;
 		stringSplit(pathStr, parts);
 
-		// The last part of the string - which is something like '/user/hand/right/input/a/click' - is the mode
-		strcpy_arr(info.rchModeName, parts.back().c_str());
+		// The layout below assumes '/user/hand/<side>/input/<component>/<mode>'. Bound source paths
+		// aren't guaranteed to look like that (see the FIXME in GetOriginLocalizedName), and the
+		// .at() calls threw std::out_of_range straight out through the OpenVR C ABI for anything
+		// shorter. Report what we can and skip the structured breakdown for odd paths.
+		if (parts.empty()) {
+			OOVR_LOG_ONCEF("WARNING: bound source path '%s' has no components, skipping binding info", pathStr.c_str());
+			continue;
+		}
 
-		// Hardcode the first three parts of the string as being the device path, and the 4th and 5th ones as
-		// being the input path.
-		std::string devicePath = pathFromParts({ parts.at(0), parts.at(1), parts.at(2) });
-		std::string inputPath = pathFromParts({ parts.at(3), parts.at(4) });
-		strcpy_arr(info.rchDevicePathName, devicePath.c_str());
-		strcpy_arr(info.rchInputPathName, inputPath.c_str());
+		// The last part of the string - which is something like '/user/hand/right/input/a/click' - is the mode
+		strcpy_arr_trunc(info.rchModeName, parts.back().c_str(), "binding mode name");
+
+		if (parts.size() >= 5) {
+			// Hardcode the first three parts of the string as being the device path, and the 4th and 5th ones as
+			// being the input path.
+			std::string devicePath = pathFromParts({ parts.at(0), parts.at(1), parts.at(2) });
+			std::string inputPath = pathFromParts({ parts.at(3), parts.at(4) });
+			strcpy_arr_trunc(info.rchDevicePathName, devicePath.c_str(), "binding device path");
+			strcpy_arr_trunc(info.rchInputPathName, inputPath.c_str(), "binding input path");
+		} else {
+			OOVR_LOG_ONCEF("WARNING: bound source path '%s' has %zu components, expected at least 5 - "
+			               "device and input paths left blank",
+			    pathStr.c_str(), parts.size());
+		}
 
 		// FIXME replace this initial hacky thing
 		switch (action->type) {

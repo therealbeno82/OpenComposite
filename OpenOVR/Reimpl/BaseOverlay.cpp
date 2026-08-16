@@ -22,11 +22,14 @@ class BaseOverlay::OverlayData {
 public:
 	const string key;
 	string name;
-	HmdColor_t colour;
+	// Opaque white, matching SteamVR's default. Uninitialised, GetOverlayColor/GetOverlayAlpha
+	// handed the game whatever happened to be on the heap when the setter was never called.
+	HmdColor_t colour = { 1.0f, 1.0f, 1.0f, 1.0f };
 
 	float widthMeters = 1; // default 1 meter
 
-	float autoCurveDistanceRangeMin, autoCurveDistanceRangeMax; // WTF does this do?
+	// WTF does this do? Zeroed rather than left uninitialised - see the note on colour above.
+	float autoCurveDistanceRangeMin = 0.0f, autoCurveDistanceRangeMax = 0.0f;
 	EColorSpace colourSpace = ColorSpace_Auto;
 	bool visible = false; // TODO check against SteamVR
 	VRTextureBounds_t textureBounds = { 0, 0, 1, 1 };
@@ -49,7 +52,7 @@ public:
 			HmdMatrix34_t offset;
 			TrackedDeviceIndex_t device;
 		} deviceRelative;
-	} transformData;
+	} transformData = {};
 
 	MfMatrix4f overlayTransform{
 		1.0f, 0.0f, 0.0f, 0.0f,
@@ -67,20 +70,27 @@ public:
 // TODO don't pass around handles, as it will cause
 // crashes when we should merely return VROverlayError_InvalidHandle
 #define OVL (*((OverlayData**)pOverlayHandle))
+// The lock here is what makes the container lookups below safe against a game creating or
+// destroying overlays on another thread while the render thread is walking the list. It stays held
+// for the rest of the calling method, which is what we want - the OverlayData* is only guaranteed
+// to be alive while it does.
 #define USEH()                                                                        \
+	std::lock_guard<std::recursive_mutex> overlayLock(overlaysMutex);                 \
 	OverlayData* overlay = (OverlayData*)ulOverlayHandle;                             \
 	if (!overlay || !validOverlays.count(overlay) || !overlays.count(overlay->key)) { \
 		return VROverlayError_InvalidHandle;                                          \
 	}
 
-#define USEHB()                                           \
-	OverlayData* overlay = (OverlayData*)ulOverlayHandle; \
-	if (!overlay || !overlays.count(overlay->key)) {      \
-		return false;                                     \
+#define USEHB()                                                       \
+	std::lock_guard<std::recursive_mutex> overlayLock(overlaysMutex); \
+	OverlayData* overlay = (OverlayData*)ulOverlayHandle;             \
+	if (!overlay || !overlays.count(overlay->key)) {                  \
+		return false;                                                 \
 	}
 
 BaseOverlay::~BaseOverlay()
 {
+	std::lock_guard<std::recursive_mutex> lock(overlaysMutex);
 	for (const auto& kv : overlays) {
 		if (kv.second) {
 			delete kv.second;
@@ -90,6 +100,10 @@ BaseOverlay::~BaseOverlay()
 
 int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompositionLayerBaseHeader const* const*& layers)
 {
+	// This runs on the render thread and walks `overlays`, which the game can mutate from its own
+	// thread at any point. Without this, a DestroyOverlay landing mid-iteration is a use-after-free.
+	std::lock_guard<std::recursive_mutex> lock(overlaysMutex);
+
 	// Note that at least on MSVC, this shouldn't be doing any memory allocations
 	//  unless the list is expanding from new layers.
 	layerHeaders.clear();
@@ -193,6 +207,8 @@ EVROverlayError BaseOverlay::SetSubviewPosition(VROverlayHandle_t ulOverlayHandl
 
 EVROverlayError BaseOverlay::FindOverlay(const char* pchOverlayKey, VROverlayHandle_t* pOverlayHandle)
 {
+	std::lock_guard<std::recursive_mutex> lock(overlaysMutex);
+
 	if (overlays.count(pchOverlayKey)) {
 		OVL = overlays[pchOverlayKey];
 		return VROverlayError_None;
@@ -203,6 +219,8 @@ EVROverlayError BaseOverlay::FindOverlay(const char* pchOverlayKey, VROverlayHan
 }
 EVROverlayError BaseOverlay::CreateOverlay(const char* pchOverlayKey, const char* pchOverlayName, VROverlayHandle_t* pOverlayHandle)
 {
+	std::lock_guard<std::recursive_mutex> lock(overlaysMutex);
+
 	if (overlays.count(pchOverlayKey)) {
 		return VROverlayError_KeyInUse;
 	}
@@ -924,10 +942,9 @@ EVROverlayError BaseOverlay::ShowKeyboardForOverlay(VROverlayHandle_t ulOverlayH
 }
 uint32_t BaseOverlay::GetKeyboardText(char* pchText, uint32_t cchText)
 {
-	string str = keyboard ? VRKeyboard::CHAR_CONV.to_bytes(keyboard->contents()) : keyboardCache;
-
 	// Since keyboard is not functional yet, return this default text (Adventurer because this fix was made specifically for Skyrim VR)
-	str = "Adventurer";
+	// Note: this used to compute the real keyboard contents first and then throw them away.
+	string str = "Adventurer";
 
 	// A zero buffer size is a legitimate "what's the required size?" probe - report it without writing.
 	if (cchText != 0) {

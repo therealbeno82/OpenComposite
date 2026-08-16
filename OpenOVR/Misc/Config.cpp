@@ -84,7 +84,10 @@ static HmdColor_t parse_HmdColor_t(string orig, string name, int line)
 	}
 
 	HmdColor_t c;
-	c.a = 255; // Full alpha
+	// HmdColor_t is normalised floats, not bytes - the rgb lines below already divide by 255.
+	// This used to be 255, which consumers turn into (uint8_t)(255 * 255) == 1, i.e. hands that
+	// were very nearly transparent for anyone who set this option.
+	c.a = 1.0f; // Full alpha
 
 	c.r = ((hexval(val[1]) << 4) + hexval(val[2])) / 255.0f;
 	c.g = ((hexval(val[3]) << 4) + hexval(val[4])) / 255.0f;
@@ -102,8 +105,6 @@ invalid:
 
 static float parse_float(string orig, string name, int line)
 {
-	string val = str_tolower(orig);
-
 	const char* str = orig.c_str();
 	char* end = NULL;
 	float result = strtof(str, &end);
@@ -150,6 +151,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, hiddenMeshVerticalScale);
 		CFGOPT(bool, logAllOpenVRCalls);
 		CFGOPT(float, hitchWarningMs);
+		CFGOPT(float, frameTimingSummaryFrames);
 	}
 
 #undef CFGOPT

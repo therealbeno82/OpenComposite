@@ -100,32 +100,42 @@ void InteractionProfile::AddLegacyBindings(const LegacyControllerActions& ctrl, 
 
 const InteractionProfile::ProfileList& InteractionProfile::GetProfileList()
 {
-	static std::vector<std::unique_ptr<InteractionProfile>> profiles;
-	if (profiles.empty()) {
+	// Built inside the initialiser of a function-local static rather than with an `if (empty())`
+	// check afterwards. Both give a single fill, but only this form is thread-safe: the old shape
+	// let the event-pump thread (UpdateInteractionProfile) and the game thread (SetActionManifestPath)
+	// both see an empty vector and both fill it. C++11 guarantees exactly one thread runs this
+	// lambda while the others block.
+	static const std::vector<std::unique_ptr<InteractionProfile>> profiles = [] {
+		std::vector<std::unique_ptr<InteractionProfile>> list;
 		if (xr_ext->G2Controller_Available())
-			profiles.emplace_back(std::make_unique<ReverbG2InteractionProfile>());
+			list.emplace_back(std::make_unique<ReverbG2InteractionProfile>());
 
-		profiles.emplace_back(std::make_unique<HolographicInteractionProfile>());
-		profiles.emplace_back(std::make_unique<IndexControllerInteractionProfile>());
-		profiles.emplace_back(std::make_unique<ViveWandInteractionProfile>());
-		profiles.emplace_back(std::make_unique<OculusTouchInteractionProfile>());
-		profiles.emplace_back(std::make_unique<KhrSimpleInteractionProfile>());
-		profiles.emplace_back(std::make_unique<ViveTrackerInteractionProfile>());
-	}
+		list.emplace_back(std::make_unique<HolographicInteractionProfile>());
+		list.emplace_back(std::make_unique<IndexControllerInteractionProfile>());
+		list.emplace_back(std::make_unique<ViveWandInteractionProfile>());
+		list.emplace_back(std::make_unique<OculusTouchInteractionProfile>());
+		list.emplace_back(std::make_unique<KhrSimpleInteractionProfile>());
+		list.emplace_back(std::make_unique<ViveTrackerInteractionProfile>());
+		return list;
+	}();
 	return profiles;
 }
 
 InteractionProfile* InteractionProfile::GetProfileByPath(const string& name)
 {
-	static std::map<std::string, InteractionProfile*> byPath;
-	if (byPath.empty()) {
+	// Same reasoning as GetProfileList above.
+	static const std::map<std::string, InteractionProfile*> byPath = [] {
+		std::map<std::string, InteractionProfile*> map;
 		for (const std::unique_ptr<InteractionProfile>& profile : GetProfileList()) {
-			byPath[profile->GetPath()] = profile.get();
+			map[profile->GetPath()] = profile.get();
 		}
-	}
-	if (!byPath.contains(name))
+		return map;
+	}();
+
+	auto it = byPath.find(name);
+	if (it == byPath.end())
 		OOVR_ABORTF("Could not find interaction profile '%s'", name.c_str());
-	return byPath.at(name);
+	return it->second;
 }
 
 glm::mat4 InteractionProfile::GetGripToSteamVRTransform(ITrackedDevice::TrackedDeviceType hand) const
@@ -140,7 +150,8 @@ glm::mat4 InteractionProfile::GetGripToSteamVRTransform(ITrackedDevice::TrackedD
 
 std::optional<glm::mat4> InteractionProfile::GetComponentTransform(ITrackedDevice::TrackedDeviceType hand, const std::string& name) const
 {
-	std::unordered_map<std::string, glm::mat4> transforms = hand == ITrackedDevice::HAND_RIGHT ? rightComponentTransforms : leftComponentTransforms;
+	// Reference, not copy - this is called on the per-frame input path.
+	const auto& transforms = hand == ITrackedDevice::HAND_RIGHT ? rightComponentTransforms : leftComponentTransforms;
 	const auto iter = transforms.find(name);
 	if (iter == transforms.end())
 		return {};
@@ -150,22 +161,32 @@ std::optional<glm::mat4> InteractionProfile::GetComponentTransform(ITrackedDevic
 
 std::optional<std::array<vr::VRBoneTransform_t, 31>> InteractionProfile::GetSkeletalReferencePose(ITrackedDevice::TrackedDeviceType hand, int pose) const
 {
-	auto poses = hand == ITrackedDevice::HAND_LEFT ? leftHandPoses : rightHandPoses;
+	// Reference, not copy: this runs per frame from GetSkeletalBoneData and the hand-tracking
+	// fallback, and the maps hold 31-bone arrays - copying them per call allocates constantly.
+	const auto& poses = hand == ITrackedDevice::HAND_LEFT ? leftHandPoses : rightHandPoses;
 
-	// Fall back to oculus poses, which should be close enough for most controllers
+	// Fall back to oculus poses, which should be close enough for most controllers. Built once,
+	// not per call.
+	static const std::array<std::array<vr::VRBoneTransform_t, 31>, 4> leftFallback = {
+		oculus::leftBindPose,
+		oculus::leftOpenHandPose,
+		oculus::leftFistPose,
+		oculus::leftGripLimitPose,
+	};
+	static const std::array<std::array<vr::VRBoneTransform_t, 31>, 4> rightFallback = {
+		oculus::rightBindPose,
+		oculus::rightOpenHandPose,
+		oculus::rightFistPose,
+		oculus::rightGripLimitPose,
+	};
+
+	// The fallback is indexed by the OpenVR reference-pose enum (BindPose..GripLimit are 0..3)
 	if (poses.empty()) {
 		OOVR_LOG_ONCE("WARNING: No reference poses defined for interaction profile, using fallback.");
-		if (hand == ITrackedDevice::HAND_LEFT) {
-			poses[VRSkeletalReferencePose_BindPose] = oculus::leftBindPose;
-			poses[VRSkeletalReferencePose_OpenHand] = oculus::leftOpenHandPose;
-			poses[VRSkeletalReferencePose_Fist] = oculus::leftFistPose;
-			poses[VRSkeletalReferencePose_GripLimit] = oculus::leftGripLimitPose;
-		} else {
-			poses[VRSkeletalReferencePose_BindPose] = oculus::rightBindPose;
-			poses[VRSkeletalReferencePose_OpenHand] = oculus::rightOpenHandPose;
-			poses[VRSkeletalReferencePose_Fist] = oculus::rightFistPose;
-			poses[VRSkeletalReferencePose_GripLimit] = oculus::rightGripLimitPose;
-		}
+		const auto& fallback = hand == ITrackedDevice::HAND_LEFT ? leftFallback : rightFallback;
+		if (pose >= 0 && pose < (int)fallback.size())
+			return fallback[pose];
+		return {};
 	}
 
 	const auto iter = poses.find(pose);

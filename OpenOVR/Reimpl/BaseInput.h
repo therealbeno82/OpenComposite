@@ -371,6 +371,17 @@ public: // INTERNAL FUNCTIONS
 	void BindInputsForSession();
 
 	/**
+	 * Release the per-session handles BindInputsForSession created, while the session is still
+	 * alive to destroy them against.
+	 *
+	 * Must be called before xrDestroySession. The hand trackers were previously left holding
+	 * handles from a session that no longer existed - harmless while nothing touched them, but
+	 * ~BaseInput would then call xrDestroyHandTrackerEXT on a dead handle, and a session restart
+	 * silently overwrote them.
+	 */
+	void ReleaseSessionHandles();
+
+	/**
 	 * Similar to setting the manifest, but doesn't actually load one. Equivalent to passing in a blank manifest.
 	 *
 	 * If a manifest is already loaded, this does nothing. It should be called when a function from the legacy
@@ -786,12 +797,33 @@ private:
 
 	vr::ETrackedControllerRole dominantHand = vr::TrackedControllerRole_RightHand;
 
+	/**
+	 * Transparent hash/equality so this map can be looked up with a const char* or string_view
+	 * without building a temporary std::string.
+	 *
+	 * GetInputSourceHandle is on the per-frame path - activeOriginFromSubaction calls it for every
+	 * action times every subaction path, every frame - and took the const char* the game passed
+	 * straight into find(), allocating each time.
+	 */
+	struct StringHash {
+		using is_transparent = void;
+		size_t operator()(std::string_view sv) const { return std::hash<std::string_view>{}(sv); }
+	};
+	struct StringEqual {
+		using is_transparent = void;
+		bool operator()(std::string_view a, std::string_view b) const { return a == b; }
+	};
+
 	// TODO convert to Registry
-	std::unordered_map<std::string, std::unique_ptr<InputValueHandle>> inputHandleRegistry;
+	std::unordered_map<std::string, std::unique_ptr<InputValueHandle>, StringHash, StringEqual> inputHandleRegistry;
 
 	std::unordered_map<std::string, XrAction> indexGripExtensionActions;
 
 	XrActionSet legacyInputsSet = XR_NULL_HANDLE;
+
+	// Scratch buffer for UpdateActionState's xrSyncActions call, avoiding a heap allocation on the
+	// per-frame input path. Most games pass 1-3 action sets; anything beyond this size allocates.
+	std::array<XrActiveActionSet, 16> activeActionSetBuffer{};
 
 	/**
 	 * The list of subaction paths anything can be bound to - this basically just means 'everything' and contains
@@ -860,11 +892,9 @@ private:
 	EVRInputError getEstimatedSkeletalSummary(ITrackedDevice::TrackedDeviceType hand, VRSkeletalSummaryData_t* pSkeletalSummaryData);
 	EVRInputError getEstimatedBoneData(ITrackedDevice::TrackedDeviceType hand, EVRSkeletalTransformSpace transformSpace, EVRSkeletalMotionRange eMotionRange, std::span<VRBoneTransform_t, eBone_Count> boneData);
 
-	/**
-	 * Some games (i.e. newer Unity games) won't explicitly call SetActionManifestPath, but instead will set the path through
-	 * the Steamworks web interface. If this is the case, we'll never be able to set the actions! So instead, we must discover if this is the case.
-	 * This method should only be called when a game is trying to retrieve action data (the GetXActionData family of functions).
-	 */
-	void checkIfActionsMustBeDiscoveredFromSteam();
-	bool triedDiscoveringManifest = false;
+	// Note: there was a checkIfActionsMustBeDiscoveredFromSteam() declaration and a
+	// triedDiscoveringManifest flag here for handling games that set their action manifest through
+	// the Steamworks web interface rather than calling SetActionManifestPath. Neither was ever
+	// defined or called - the case is now handled by deferring the manifest load until the game
+	// first reads the legacy inputs (see BaseSystem::_OnPostFrame).
 };

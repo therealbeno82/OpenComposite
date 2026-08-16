@@ -304,7 +304,17 @@ ovr_enum_t BaseCompositor::Submit(EVREye eye, const Texture_t* texture, const VR
 
 ovr_enum_t BaseCompositor::SubmitWithArrayIndex(vr::EVREye eye, const vr::Texture_t* texture, uint32_t idx, const vr::VRTextureBounds_t* bounds, vr::EVRSubmitFlags submitFlags)
 {
-	return Submit(eye, &texture[idx], bounds, submitFlags);
+	// unTextureArrayIndex selects a slice *inside* one texture array - it is not an index into an
+	// array of Texture_t. This used to pass &texture[idx], reading idx * sizeof(Texture_t) bytes
+	// past the caller's single struct for the right eye of every single-pass-instanced title.
+	//
+	// The compositors pick the slice from the eye (see the arraySlice handling in
+	// DX11/DX12 CopyToSwapchain), which gives the right answer for the standard
+	// left-slice-0/right-slice-1 layout that games using this call actually use.
+	if (idx != 0 && idx != 1)
+		OOVR_LOG_ONCEF("WARNING: SubmitWithArrayIndex with unexpected array index %u", idx);
+
+	return Submit(eye, texture, bounds, submitFlags);
 }
 
 void BaseCompositor::ClearLastSubmittedFrame()
@@ -344,7 +354,14 @@ uint32_t BaseCompositor::GetFrameTimings(OOVR_Compositor_FrameTiming* pTiming, u
 	// This is a request to fill out an array of timing data. However only an arbitrary number
 	// of records are available with number being filled returned. In the case of only one record
 	// being available we can just send the most recent timing data and return 1.
-	bool populated = BackendManager::Instance().GetFrameTiming(pTiming, 1);
+	//
+	// Note the 0: "the most recent record" is unFramesAgo=0. This used to pass 1, which the backend
+	// then rejected outright, so GetFrameTimings always returned 0 and left the caller's array
+	// untouched. F1 25 calls this every run.
+	if (nFrames == 0 || !pTiming)
+		return 0;
+
+	bool populated = BackendManager::Instance().GetFrameTiming(pTiming, 0);
 	return populated ? 1 : 0;
 }
 
@@ -360,12 +377,20 @@ uint32_t BaseCompositor::GetFrameTimings(vr::Compositor_FrameTiming* pTiming, ui
 
 float BaseCompositor::GetFrameTimeRemaining()
 {
-	STUBBED();
+	// STUBBED() here would abort the game with a dialog. OpenXR gives us no way to know how long
+	// is left before the runtime wants the frame, and a game asking is usually deciding whether to
+	// squeeze in more work - reporting no headroom is the safe answer, and beats being killed.
+	OOVR_LOG_ONCE("WARNING: GetFrameTimeRemaining is not implemented, reporting no time remaining");
+	return 0.0f;
 }
 
 void BaseCompositor::GetCumulativeStats(OOVR_Compositor_CumulativeStats* pStats, uint32_t nStatsSizeInBytes)
 {
-	STUBBED();
+	// As above - this used to abort. We don't track any of these counters, so report zeroes rather
+	// than killing the game over a statistics call.
+	OOVR_LOG_ONCE("WARNING: GetCumulativeStats is not implemented, reporting zeroes");
+	if (pStats && nStatsSizeInBytes)
+		memset(pStats, 0, nStatsSizeInBytes);
 }
 
 void BaseCompositor::FadeToColor(float fSeconds, float fRed, float fGreen, float fBlue, float fAlpha, bool bBackground)

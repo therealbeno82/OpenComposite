@@ -22,20 +22,43 @@ void XrHMD::GetRecommendedRenderTargetSize(uint32_t* width, uint32_t* height)
 
 // from BaseSystem
 
+XrFovf XrHMD::GetCachedFov(vr::EVREye eEye)
+{
+	const XruCachedViews& cachedViews = xr_gbl->GetCachedViews(xr_gbl->seatedSpace);
+
+	std::lock_guard<std::mutex> lock(cachedViewMutex);
+
+	// A short viewCount means xrLocateViews failed - a transient hiccup with a streaming runtime.
+	// This used to OOVR_FALSE_ABORT, killing the game over something recoverable.
+	if (cachedViews.viewCount == XruEyeCount) {
+		cachedFov[0] = cachedViews.views[0].fov;
+		cachedFov[1] = cachedViews.views[1].fov;
+		haveCachedProjection = true;
+	} else if (!haveCachedProjection) {
+		// Nothing good has ever come back. A symmetric 90-degree FOV keeps the maths finite until
+		// the runtime starts answering; the caller clamps degenerate values anyway.
+		OOVR_LOG_ONCE("WARNING: xrLocateViews has not yet returned valid views, using a placeholder FOV");
+		constexpr float quarterPi = 0.7853982f;
+		for (XrFovf& fov : cachedFov)
+			fov = XrFovf{ -quarterPi, quarterPi, quarterPi, -quarterPi };
+		haveCachedProjection = true;
+	} else {
+		OOVR_LOG_ONCE("WARNING: xrLocateViews failed, reusing the last known-good FOV");
+	}
+
+	return cachedFov[eEye];
+}
+
 vr::HmdMatrix44_t XrHMD::GetProjectionMatrix(vr::EVREye eEye, float fNearZ, float fFarZ, EGraphicsAPIConvention convention)
 {
 	if (eEye < 0 || (int)eEye >= 2)
 		eEye = vr::Eye_Left;
 
-	const XruCachedViews& cachedViews = xr_gbl->GetCachedViews(xr_gbl->seatedSpace);
-	const std::array<XrView, XruEyeCount>& views = cachedViews.views;
-	OOVR_FALSE_ABORT(cachedViews.viewCount == XruEyeCount);
-
 	// Build the projection matrix
 	// It looks like there aren't any functions in glm that can take different l/r/t/b FOV values, so do it ourselves
 	// Also calculate the projection matrix as row major (so one column determines one value when multiplied with a
 	// vector) and then transpose it back to being a column-major vector.
-	const XrFovf& fov = views[eEye].fov;
+	const XrFovf fov = GetCachedFov(eEye);
 
 	const float twoNear = fNearZ * 2;
 	float tanL = tanf(fov.angleLeft);
@@ -82,12 +105,7 @@ void XrHMD::GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight, flo
 	if (eEye < 0 || (int)eEye >= 2)
 		eEye = vr::Eye_Left;
 
-	// TODO deduplicate with GetProjectionMatrix
-	const XruCachedViews& cachedViews = xr_gbl->GetCachedViews(xr_gbl->seatedSpace);
-	const std::array<XrView, XruEyeCount>& views = cachedViews.views;
-	OOVR_FALSE_ABORT(cachedViews.viewCount == XruEyeCount);
-
-	const XrFovf& fov = views[eEye].fov;
+	const XrFovf fov = GetCachedFov(eEye);
 
 	/**
 	 * With a straight passthrough:
@@ -128,9 +146,6 @@ bool XrHMD::ComputeDistortion(vr::EVREye eEye, float fU, float fV, vr::Distortio
 
 vr::HmdMatrix34_t XrHMD::GetEyeToHeadTransform(vr::EVREye eEye)
 {
-	static XrTime time = ~0; // Don't set to zero by default, otherwise we'll return an identity matrix before the first frame
-	static XrView views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
-
 	// This loop is a silent infinite hang if the session never comes up - the process stays alive with a
 	// frozen log, which is near-impossible to diagnose. Make the wait visible.
 	if (!xr_gbl) {
@@ -149,18 +164,33 @@ vr::HmdMatrix34_t XrHMD::GetEyeToHeadTransform(vr::EVREye eEye)
 	if (eEye < 0 || (int)eEye >= 2)
 		eEye = vr::Eye_Left;
 
-	if (time != xr_gbl->GetBestTime()) {
+	const XrTime now = xr_gbl->GetBestTime();
+
+	// Fetch outside the lock - GetCachedViews can call into the runtime.
+	bool refresh;
+	{
+		std::lock_guard<std::mutex> lock(cachedViewMutex);
+		refresh = cachedViewTime != now;
+	}
+
+	if (refresh) {
 		const XruCachedViews& cachedViews = xr_gbl->GetCachedViews(xr_gbl->viewSpace);
 		const XrViewState& viewState = cachedViews.viewState;
-		if (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT && viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) {
-			OOVR_FALSE_ABORT(cachedViews.viewCount == XruEyeCount);
-			views[0] = cachedViews.views[0];
-			views[1] = cachedViews.views[1];
-			time = xr_gbl->GetBestTime();
+
+		std::lock_guard<std::mutex> lock(cachedViewMutex);
+		// A short viewCount used to hard-abort here. Keeping the previous frame's transform is the
+		// right answer for a transient failure - the eyes haven't moved relative to the head.
+		if (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT
+		    && viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT
+		    && cachedViews.viewCount == XruEyeCount) {
+			cachedEyeViews[0] = cachedViews.views[0];
+			cachedEyeViews[1] = cachedViews.views[1];
+			cachedViewTime = now;
 		}
 	}
 
-	return G2S_m34(X2G_om34_pose(views[eEye].pose));
+	std::lock_guard<std::mutex> lock(cachedViewMutex);
+	return G2S_m34(X2G_om34_pose(cachedEyeViews[eEye].pose));
 }
 
 bool XrHMD::GetTimeSinceLastVsync(float* pfSecondsSinceLastVsync, uint64_t* pulFrameCounter)
@@ -170,6 +200,12 @@ bool XrHMD::GetTimeSinceLastVsync(float* pfSecondsSinceLastVsync, uint64_t* pulF
 	if (pfSecondsSinceLastVsync)
 		*pfSecondsSinceLastVsync = 0.011f;
 
+	// The contract (see IHMD::GetTimeSinceLastVsync) is to zero both outputs when returning false.
+	// This used to leave pulFrameCounter untouched, so a game reading it got whatever was already
+	// in its variable - frozen if zeroed, garbage if not.
+	if (pulFrameCounter)
+		*pulFrameCounter = 0;
+
 	return false;
 }
 
@@ -177,6 +213,7 @@ vr::HiddenAreaMesh_t XrHMD::GetHiddenAreaMesh(vr::EVREye eEye, vr::EHiddenAreaMe
 {
 	if (!xr_ext->xrGetVisibilityMaskKHR_Available()) {
 		// This is what the docs say we should return if the mask is unavailable
+		OOVR_LOG_ONCE("WARNING: game asked for the hidden area mesh but the runtime has no visibility mask extension");
 		return vr::HiddenAreaMesh_t{ nullptr, 0 };
 	}
 
@@ -199,7 +236,15 @@ vr::HiddenAreaMesh_t XrHMD::GetHiddenAreaMesh(vr::EVREye eEye, vr::EHiddenAreaMe
 
 	// SteamVR caches these and never frees them, so do the same - otherwise every call leaks a heap
 	// buffer, and games are allowed to query this repeatedly.
+	//
+	// The mutex guards the map, not just the lookup: this is reachable from whatever thread the
+	// game calls IVRSystem on, and two threads inserting at once would corrupt it. It is held
+	// across the runtime calls below too, so a concurrent miss on the same key doesn't build the
+	// mesh twice and leak one of them.
+	static std::mutex meshCacheMutex;
 	static std::map<std::pair<vr::EVREye, vr::EHiddenAreaMeshType>, vr::HiddenAreaMesh_t> meshCache;
+	std::lock_guard<std::mutex> meshCacheLock(meshCacheMutex);
+
 	auto cacheKey = std::make_pair(eEye, type);
 	auto it = meshCache.find(cacheKey);
 	if (it != meshCache.end())
@@ -214,6 +259,11 @@ vr::HiddenAreaMesh_t XrHMD::GetHiddenAreaMesh(vr::EVREye eEye, vr::EHiddenAreaMe
 	OOVR_FAILED_XR_ABORT(xr_ext->xrGetVisibilityMaskKHR(xr_session.get(), XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye, xrType, &mask));
 
 	// TODO handle cases where a mask isn't available
+
+	// Keep the capacity query's answer so the log below can distinguish "the runtime only has this
+	// much mask" from "the runtime promised more than it delivered on the second call".
+	const uint32_t queriedVertexCount = mask.vertexCountOutput;
+	const uint32_t queriedIndexCount = mask.indexCountOutput;
 
 	// Allocate memory for the mesh
 	mask.vertexCapacityInput = mask.vertexCountOutput;
@@ -242,6 +292,8 @@ vr::HiddenAreaMesh_t XrHMD::GetHiddenAreaMesh(vr::EVREye eEye, vr::EHiddenAreaMe
 			OOVR_LOG_ONCE("WARNING: runtime returned visibility mask indices out of bounds, dropping mesh");
 			delete[] mask.indices;
 			delete[] mask.vertices;
+			// arr was leaked here - the mesh is being dropped, so nothing else will ever free it.
+			delete[] arr;
 			return vr::HiddenAreaMesh_t{ nullptr, 0 };
 		}
 		XrVector2f v = mask.vertices[index];
@@ -266,6 +318,20 @@ vr::HiddenAreaMesh_t XrHMD::GetHiddenAreaMesh(vr::EVREye eEye, vr::EHiddenAreaMe
 	// Delete the buffers
 	delete[] mask.indices;
 	delete[] mask.vertices;
+
+	// One line per eye/type, since the cache means this only runs once each. Without it there is no
+	// way to tell from a log whether a game actually uses the hidden-area mesh - a game that never
+	// asks and a game that asks and gets nothing look identical.
+	// The raw counts matter: a runtime that advertises XR_KHR_visibility_mask but returns a
+	// degenerate mask (a single triangle, say) is indistinguishable from us mis-calling it unless
+	// both the runtime's numbers and our result are recorded. Games check this - F1 25 disables
+	// its stencil mesh outright if the mesh it gets back looks useless.
+	OOVR_LOGF("Hidden area mesh: eye %d type %d -> %u triangles | query said %u verts/%u indices, fill gave %u verts/%u indices (fix=%d, verticalScale=%.2f)",
+	    (int)eEye, (int)type, result.unTriangleCount,
+	    queriedVertexCount, queriedIndexCount,
+	    mask.vertexCountOutput, mask.indexCountOutput,
+	    (int)oovr_global_configuration.EnableHiddenMeshFix(),
+	    oovr_global_configuration.HiddenMeshVerticalScale());
 
 	meshCache[cacheKey] = result;
 	return result;
@@ -331,16 +397,18 @@ float XrHMD::GetIPD()
 	const XruCachedViews& cachedViews = xr_gbl->GetCachedViews(xr_gbl->viewSpace);
 	const XrViewState& state = cachedViews.viewState;
 	const std::array<XrView, XruEyeCount>& views = cachedViews.views;
-	OOVR_FALSE_ABORT(cachedViews.viewCount == XruEyeCount);
 
-	// Fallback used until the runtime gives us valid view poses. 64mm is roughly the average human IPD -
-	// note this is in metres, so it's 0.064 and not 0.0064.
-	static float ipd = 0.064f;
+	// cachedIpd holds the fallback (see XrHMD.h) and the last known-good value. A short viewCount
+	// used to hard-abort here even though the fallback below already covered exactly that case.
+	std::lock_guard<std::mutex> lock(cachedViewMutex);
 
-	if (state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT && state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)
-		ipd = views[vr::Eye_Right].pose.position.x - views[vr::Eye_Left].pose.position.x;
+	if (cachedViews.viewCount == XruEyeCount
+	    && state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT
+	    && state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) {
+		cachedIpd = views[vr::Eye_Right].pose.position.x - views[vr::Eye_Left].pose.position.x;
+	}
 
-	return ipd;
+	return cachedIpd;
 }
 
 #define TRY_PROFILE_PROP(type)                                                     \
@@ -389,7 +457,10 @@ float XrHMD::GetFloatTrackedDeviceProperty(vr::ETrackedDeviceProperty prop, vr::
 
 	switch (prop) {
 	case vr::Prop_DisplayFrequency_Float:
-		return 90.0; // TODO use the real value
+		// Taken from the runtime's predictedDisplayPeriod rather than hardcoded - a Quest can be
+		// running at 72, 80, 90 or 120Hz and games use this for frame pacing. Falls back to 90
+		// only until the first frame has completed.
+		return xr_gbl ? xr_gbl->GetDisplayFrequency() : 90.0f;
 	case vr::Prop_LensCenterLeftU_Float:
 	case vr::Prop_LensCenterLeftV_Float:
 	case vr::Prop_LensCenterRightU_Float:
@@ -447,6 +518,18 @@ uint32_t XrHMD::GetStringTrackedDeviceProperty(vr::ETrackedDeviceProperty prop,
 	PROP(vr::Prop_RenderModelName_String, "oculusHmdRenderModel");
 
 	PROP(vr::Prop_ControllerType_String, "oculus"); // If this is null on the HMD VRChat ignores the HMD entirely
+
+	// The runtime knows exactly which headset this is - XrSystemProperties::systemName is what the
+	// startup log prints as "Started OpenXR session on runtime '...'" (e.g. "Meta Quest 3").
+	//
+	// This was previously unanswered for the HMD, so games fell back to a guess from the
+	// manufacturer string alone. F1 25 in particular then picks its default Oculus profile
+	// (Quest 2) and applies that headset's defaults, regardless of what's actually plugged in.
+	//
+	// Note Prop_TrackingSystemName_String deliberately stays "oculus" - games match on that for
+	// controller bindings, and VRChat needs it.
+	if (xr_gbl && xr_gbl->systemProperties.systemName[0] != '\0')
+		PROP(vr::Prop_ModelNumber_String, xr_gbl->systemProperties.systemName);
 
 	return XrTrackedDevice::GetStringTrackedDeviceProperty(prop, value, bufferSize, pErrorL);
 }

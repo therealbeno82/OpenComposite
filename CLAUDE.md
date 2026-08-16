@@ -4,7 +4,7 @@ OpenComposite implements SteamVR's OpenVR API and forwards to OpenXR, so SteamVR
 without SteamVR. The DLL is built as `vrclient_x64.dll` and installed by copying it over a
 game's `openvr_api.dll`.
 
-This file records the state of this checkout as of **2026-08-13**. Everything below was
+This file records the state of this checkout as of **2026-08-16**. Everything below was
 established by building and running against real games, not by reading alone.
 
 ---
@@ -22,8 +22,9 @@ needs the .NET Framework 4.8 dev pack and is unrelated to the DLL.
 
 ### Dependencies are hand-installed
 
-This directory is **not a git repo** (no `.git`), so `git submodule update --init` cannot work.
-The dependencies were fetched manually:
+This directory is a **local-only git repo** — one branch, no remote — so
+`git submodule update --init` cannot work. (It genuinely had no `.git` before 2026-08-15; that
+changed, but the dependency situation did not.) The dependencies were fetched manually:
 
 | Path | Source | Version | Notes |
 |---|---|---|---|
@@ -82,6 +83,13 @@ that crashed — but it writes a flushed line per OpenVR call.
 
 **The log keeps only one previous run**, as `opencomposite.log.1` (since 2026-08-14 — it used to
 truncate outright). Two launches still lose the run you cared about, so copy it aside first.
+This bit *has* since eaten a run that mattered: anything worth keeping goes to a
+`opencomposite-<date>-<what>.log` in the same folder, out of the rotation's way.
+
+**`logGetTrackedProperty=true` is cheap and underused.** Unlike `logAllOpenVRCalls` it logs only
+property queries, and it answered "which property does this game actually key off?" in a single
+run — the answer for F1 25 was *one* property for the whole session. Reach for it before
+theorising about what a game reads from us.
 
 ---
 
@@ -187,6 +195,56 @@ recreating per frame; single map lookups on the per-frame input path.
 shaders, sampler and shader resources. Previously it clobbered them — a likely source of
 game-specific rendering corruption.
 
+### Second review pass (2026-08-16)
+
+Compile-verified and run against F1 25. Grouped by what each would actually cost you.
+
+**Memory corruption:** `GetCachedViews` inserted into an `unordered_map` while holding only a
+`std::shared_lock` — two threads on a cache miss corrupt the map (this was a *regression* from an
+earlier uncommitted "optimisation"; the insert now takes the exclusive lock, with the runtime call
+outside it). Three `delete` on `new[]` allocations in `BaseRenderModels`. `handTrackers[2]` indexed
+with `HAND_NONE` (== 3) from `GetSkeletalSummaryData`.
+
+**Working-tree regression:** `UpdateActionState`'s `xrSyncActions` buffer was moved from a
+per-frame `std::vector` (zeroed every frame) to a persistent member (zeroed once), but
+`subactionPath` is only written conditionally — so a set restricted to one hand on one frame stayed
+restricted forever. Slots are now cleared per frame.
+
+**Exceptions escaping the C ABI:** four sites in `BaseInput` threw `std::out_of_range` out through
+OpenVR into the game — `replace(find(...), ...)` with no `npos` check (×2), `int endOfHandPos`
+truncating `npos` to −1 before `erase`, and `parts.at(3)/.at(4)` on paths with fewer components.
+Bound-source paths come from the game's binding JSON and are not guaranteed to look like
+`/user/hand/<side>/input/<x>/<y>`. Also `strcpy_arr` → a truncating variant at every site fed by
+game data; `strcpy_s` invokes the MSVC invalid-parameter handler (process termination) on overflow,
+and `escapePathString` can *grow* a name past `XR_MAX_ACTION_NAME_SIZE`.
+
+**DX12:** resource barriers around every copy/resolve, and the swapchain image returned to
+`RENDER_TARGET` before `xrReleaseSwapchainImage` as `XR_KHR_D3D12_enable` requires — there were
+none at all. Array-texture slice selection (both eyes previously got slice 0, i.e. the left image
+twice). Degenerate `D3D12_BOX` guard. Finite fence-wait timeout and a checked
+`SetEventOnCompletion`, so a TDR can't hang the render thread forever. Removed a `_DEBUG`
+`D3D12GetDebugInterface` null-deref that fires on any machine without the Windows "Graphics Tools"
+feature — and which ran *after* device creation, so it was a no-op even when it worked.
+**Deliberately not done:** transitioning the *source* texture. OpenVR does not specify what state a
+game hands it over in, and naming the wrong `StateBefore` is worse than naming none.
+
+**Frame-timing API:** `GetFrameTimings` passed `unFramesAgo = 1`, which the backend rejected, so it
+always returned 0 and wrote nothing. And the `unFramesAgo > 0` guard itself was wrong — OpenVR
+documents *"sets oldest timing info if nFramesAgo is larger than the stored history"*, i.e. clamp,
+not fail. **F1 25 asks for 5 frames ago and was getting nothing.** `GetFrameTimeRemaining` and
+`GetCumulativeStats` were `STUBBED()`, which is `OOVR_ABORT` — they now return sane values instead
+of killing the game. `GetTimeSinceLastVsync` now zeroes `pulFrameCounter` per its contract.
+
+**Also:** `SubmitWithArrayIndex` read `idx * sizeof(Texture_t)` past the caller's struct;
+`handColour` alpha was `255` in a 0..1 float field (giving near-transparent hands); overlay
+container locking between the render and game threads; `InteractionProfile`'s static tables built
+via a proper thread-safe initialiser; hand trackers released before their session is destroyed;
+`uint16_t` loop counter against a `uint32_t` vertex count; `split_face` substring length swapped.
+
+**Checked and *not* a bug** (so it doesn't get "fixed" again): `logging.cpp`'s
+`duration<long, std::milli>` does overflow 32-bit `long`, but the truncation cancels in the
+subsequent subtraction and yields the correct millisecond value. The log's own timestamps confirm it.
+
 ---
 
 ## RESOLVED: the 2026-08-14 frame-time collapse — the headset link had dropped to USB2
@@ -228,24 +286,124 @@ performance complaint. Three things they let us rule out before touching any cod
 - **Not GPU load.** Settings had been *lowered* between the good and bad runs and it got worse.
 - **Not swapchain thrash.** Only the 4 expected `Generating new swap chain` lines at startup.
 
+---
+
+## RESOLVED: the "half FPS" mystery — Virtual Desktop's Synchronous SpaceWarp (2026-08-16)
+
+**Also outside OpenComposite.** F1 25's counter was reporting exactly half the headset refresh, and
+it was telling the truth — the game really was rendering at half rate while SSW synthesised the
+intermediate frames, which is why motion still looked smooth.
+
+The benchmark XMLs settled it without touching code. Four different refresh rates, four exact
+halvings, reproduced across pairs of independent runs:
+
+| Run | avg frame time | fps | headset Hz | ratio |
+|---|---|---|---|---|
+| 08-15 19:25 | 13.885 ms | 72 | 72 | full rate |
+| 08-15 19:58, 20:06 | 22.227 ms | 45 | 90 | **exactly ½** |
+| 08-15 22:47 | 27.785 ms | 36 | 72 | **exactly ½** |
+| 08-15 22:53, 23:05 | 25.008 ms | 40 | 80 | **exactly ½** |
+| 08-15 23:12, 23:17 | 16.667 ms | 60 | 120 | **exactly ½** |
+
+1000/45 = 22.2222, 1000/36 = 27.7778, 1000/40 = 25.0000, 1000/60 = 16.6667. A GPU limit does not
+land on 25.0077 ms twice. **The frame-time histograms are the clincher**: the full-rate run is a
+broad 11–16 ms spread, the half-rate runs are narrow spikes (63.5% of one run inside a single
+16–17 ms bucket). Broad spread = GPU-limited; narrow spike on exactly 2× the display period =
+externally enforced pacing.
+
+Confirmed independently the next morning: the *same DLL* and *byte-identical graphics settings*
+produced 16.667 ms (locked) at 23:17 and 12.862 ms (free-running) at 08:04. Nothing in the code
+changed between them.
+
+**If a game reports exactly half refresh, check SSW in the Virtual Desktop Streamer before
+anything else.** Note it engages when the app misses the frame budget, so it can appear to be a
+code regression when it is really the app drifting over the line.
+
+### The rolling frame-timing summary (`frameTimingSummaryFrames`, default 500)
+
+Added because the hitch watchdog only reports frames *over* its threshold, which means the
+steady-state frame — the one that actually sets your framerate — never appears in the log. One
+line per N frames:
+
+```
+FRAMES 17998-18498: 80.0 fps of 80.0Hz (1.00x) | avg 12.50ms (min 10.15 max 14.63) | xrWaitFrame 6.60 | xrBeginFrame 0.11 | locateViews 0.01 | compositor 0.06 | xrEndFrame 0.07 | game 5.66
+```
+
+Read the ratio first. **Near 0.50x means a runtime-side half-rate lock** (SSW, SteamVR motion
+smoothing) — quite different from merely being slow, which gives a ragged ratio. Safe to leave on;
+at 60fps it is one line every ~8 seconds.
+
+### What this instrumentation has already established, so don't re-derive it
+
+- **OpenComposite is not the bottleneck in F1 25, by a wide margin.** Measured while driving:
+  `compositor 0.06ms`, `xrEndFrame 0.07`, `xrBeginFrame 0.04`, `locateViews 0.00` — **0.17 ms
+  total, about 1.2% of a 14.3 ms frame.** `game` is the entire rest.
+- **The DX12 per-eye fence wait is a non-issue.** The swapchain image count is **3** (now logged),
+  so the wait is on GPU work from three frames ago. A code review flagged it as the prime suspect
+  for a frame-rate halving; measurement retired it. Don't restructure the allocator ring on a hunch.
+- **The pipeline can hit full refresh.** In menus, `game` drops to ~5.7 ms, `xrWaitFrame` absorbs
+  6.6 ms of slack, and the ratio is exactly 1.00x. Driving is game-limited, not shim-limited.
+- **A USB link drop looks like this**: `xrEndFrame` jumps from 0.07 ms to 80–195 ms in one frame
+  and stays pinned, alternating ~100/~200 ms, while `compositor` and `game` stay nominal. That is
+  VDXR unable to ship the frame. Same family as the USB2 incident above.
+
+### What F1 25 actually asks OpenComposite for
+
+Established with `logGetTrackedProperty=true` over a full run. F1 25 requests **exactly one**
+tracked-device property, once, during startup:
+
+- `Prop_DisplayFrequency_Float` (2002)
+
+That is the entire OpenVR property surface it uses. Consequences worth remembering:
+
+- **The `hmd_name="Oculus Quest2"` in its benchmark XMLs does not come from us.** The game never
+  asks who the headset is — not the model number, manufacturer, serial, or tracking system name.
+  Editing `headsetName` in `hardware_settings_config_vr.xml` is pointless; the game rewrites that
+  file on exit. Chasing this wasted a build. The label most likely comes from the
+  `XR_APILAYER_VIRTUALDESKTOP_oculus_compatibility` layer or an engine default.
+- **Display frequency has to be right before the first frame.** The game asks during startup, so
+  deriving it from `XrFrameState::predictedDisplayPeriod` is too late — that is still zero and you
+  silently serve the fallback. It now comes from `XR_FB_display_refresh_rate`
+  (`xrGetDisplayRefreshRateFB`), which answers from session creation onward, with the frame-period
+  route as fallback and 90.0 only if neither works. The startup log prints which source was used.
+
+### OPEN: the hidden-area mesh is a single triangle
+
+F1 25 *does* call `GetHiddenAreaMesh` at startup — and we return **1 triangle per eye**. A real
+lens-occlusion mask is hundreds. The game evidently sanity-checks it, because it then writes
+`stencilMesh="false"` into its VR config and keeps overwriting any manual edit. That is the game
+correctly rejecting a broken mesh, not the game being stubborn.
+
+Worth roughly 10–15% of GPU pixel work if it can be fixed. Unresolved as of 2026-08-16: the
+logging now records both the capacity query's counts and the fill's counts, which distinguishes
+
+- runtime returns a stub mask (nothing OpenComposite can do — VDXR limitation), from
+- we mis-call the two-call idiom (our bug, real saving available).
+
+Check `Hidden area mesh:` lines in the log to pick up where this left off.
+
 ## Current state
 
-**Working:** F1 25 and Automobilista 2, both via VirtualDesktopXR, no SteamVR. F1 25 holds a
-steady 72 FPS (13.89 ms, tight maxima) — that's the Quest 3 refresh cap, not a GPU limit.
+**Working:** F1 25 and Automobilista 2, both via VirtualDesktopXR, no SteamVR. At 2496x2152 per
+eye (10.7 Mpixel/frame) on a 3060 Ti, F1 25 runs ~70–80 fps while driving and hits the display cap
+exactly (1.00x) in menus. The headset is a **Meta Quest 3** — the "Quest2" in F1 25's own files is
+a mislabel from elsewhere, see above.
 
 **F1 25 is DX12.** AMS2 is DX11. Relevant because the DX11 and DX12 paths differ a lot, and the
 DX12 path has no MSAA support at all.
 
 ### Verified by running
 
-The DX11 copy path, DX12 `CopyResource` path, session lifecycle, interface registration, the
-`GetFrameTiming` bound, and the logger mutex.
+The DX11 copy path, DX12 `CopyResource` path (now with resource barriers), session lifecycle,
+interface registration, the `GetFrameTiming` bound, the logger mutex, the rolling frame-timing
+summary, and `XR_FB_display_refresh_rate`.
 
 ### NOT verified — check these first if a game misbehaves
 
 - **DX11 state save/restore** — needs `invertUsingShaders=true`; neither game exercised it
 - **DX12 bounds copy** (`CopyTextureRegion`) — only runs when bounds are non-null, which needs
   `invertUsingShaders=true`
+- **DX12 array-texture slice copy** — needs a game submitting a 2-slice stereo texture
 - **Hand-tracking fallback** — needs controllers set down mid-session
 - **MSAA resolve** (DX11 and Vulkan) — neither game submitted multisampled textures
 - **Anything Vulkan** — no Vulkan title tested
@@ -253,16 +411,32 @@ The DX11 copy path, DX12 `CopyResource` path, session lifecycle, interface regis
 
 ### Performance
 
-Measured, don't guess. A measurement pass found: F1 25 calls `GetFrameTiming` **once**, not per
-frame, so the "feed real frame timings to fix dynamic resolution" idea is **dead** — it would
-achieve nothing. The frame interval is pinned to the 72 Hz display cap. Remaining code-level
-wins (per-frame pose cache, MSAA resolve-direct-to-swapchain) are well under a millisecond on a
-frame that already finishes early.
+Measured, don't guess. **The shim costs 0.17 ms of a 14.3 ms frame.** There is essentially nothing
+left to win in this codebase for F1 25 — see the instrumentation findings above before proposing
+any optimisation.
 
-**The real lever is Virtual Desktop's refresh rate (72 → 90 Hz), not code.** Second lever is
-`supersampleRatio` in the ini. OpenComposite has no FSR/upscaling and shouldn't — use OpenXR
-Toolkit, which layers *after* OpenComposite in the OpenXR chain. Note `openvr_fsr` is
-incompatible: it also replaces `openvr_api.dll`.
+F1 25 calls `GetFrameTiming` **once**, so the "feed real frame timings to fix dynamic resolution"
+idea is **dead**. Remaining code-level wins (per-frame pose cache, MSAA resolve-direct-to-swapchain)
+are well under a millisecond on a frame that already finishes early.
+
+**The levers are all outside the code**, in rough order of value:
+
+1. **SSW off** in the Virtual Desktop Streamer, if the ratio in the FRAMES line sits near 0.50x.
+2. **Headset refresh rate** in Virtual Desktop.
+3. **`supersampleRatio`** in the ini — and it doubles as the definitive CPU-vs-GPU test: drop it
+   substantially and re-run the benchmark. fps rises in proportion → GPU-bound; fps barely moves →
+   CPU-bound, and no pixel-side setting will help.
+4. **The game's own extra scene renders** — wing mirrors, cube-map reflections, and
+   `cs_culling` (off by default in F1 25's VR config, which leaves culling on the CPU).
+
+**Beware Task Manager's aggregate numbers.** On a 16-thread CPU, one fully saturated thread is
+6.25% of the total — "25% CPU" is entirely consistent with being single-thread bound. GPU
+utilisation is "any work in flight", not saturation, so 70–80% is not 20–30% of headroom. Neither
+number can detect this bottleneck; the supersample test can.
+
+OpenComposite has no FSR/upscaling and shouldn't — use OpenXR Toolkit, which layers *after*
+OpenComposite in the OpenXR chain. Note `openvr_fsr` is incompatible: it also replaces
+`openvr_api.dll`.
 
 ---
 
@@ -276,6 +450,11 @@ cp build/bin/Release/vrclient_x64.dll "<game>/openvr_api.dll"     # note the ren
 - AMS2: `F:\Programs\Steam\steamapps\common\Automobilista 2\x64\` (`openvr_api.dll.backup` is stock
   OpenComposite, `openvr_api-orig.dll` is Valve's)
 - Known-good build kept at `build/openvr_api-KNOWN-GOOD.dll`
+
+The F1 25 folder has accumulated `openvr_api opencomposite backup N.dll` files from successive
+test builds. They are inert — nothing loads a DLL by those names — but only two are meaningful
+rollback points: `openvr_api.dll.backup` (Valve's) and `openvr_api opencomposite backup 2.dll`
+(the last pre-review build). The rest can go.
 
 The OpenXR runtime must be **VDXR**, set in Virtual Desktop Streamer settings. Selecting SteamVR
 as the OpenXR runtime defeats the entire point (OpenComposite would hand off to SteamVR) — check
@@ -300,3 +479,20 @@ add a log line, run once, read the answer.
 
 The `[startup]` trace and `logAllOpenVRCalls=true` turn "it crashes" into a named function within
 a single run. Reach for them early rather than reasoning from symptoms.
+
+**The 2026-08-16 session repeated the same lesson three times.** Each wrong turn was a plausible
+inference; each was settled by one log line:
+
+- *"The DX12 per-eye fence wait is halving the framerate."* A reasonable read of the code — DX12 is
+  the only backend that blocks the CPU on the GPU. Wrong: the swapchain has 3 images and the
+  compositor costs 0.06 ms. Logging `imageCount` and a per-phase average retired it.
+- *"The wrong headset model is why the game disables its stencil mesh."* Wrong twice over — the
+  game never asks us for the model, and the real cause was the 1-triangle mesh we hand it.
+  `logGetTrackedProperty` showed F1 25 queries exactly one property, full stop.
+- *"The counter showing half FPS must be a reporting bug in our frame timing."* Wrong: the counter
+  was honest and the app really was running at half rate. The user's own benchmark XMLs proved it
+  in minutes, without a build.
+
+Also worth internalising: **evidence the user already has often beats new instrumentation.** The
+benchmark XMLs, the frametimes CSVs, and the existing log answered more questions here than any
+code change did. Look at what's on disk before writing anything.

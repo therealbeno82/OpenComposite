@@ -142,13 +142,24 @@ static OOVR_RenderModel_Vertex_t split_face(
 	}
 
 	int vert = stoi(s.substr(0, slash1));
-	int uv = stoi(s.substr(slash1 + 1, slash1 - slash2 - 1));
+	// The length was slash1 - slash2, which underflows (slash2 > slash1) and made substr clamp to
+	// the rest of the string. It only worked because stoi stops at the next '/'.
+	int uv = stoi(s.substr(slash1 + 1, slash2 - slash1 - 1));
 	int norm = stoi(s.substr(slash2 + 1));
 
 	// OBJ references start at one
 	vert--;
 	uv--;
 	norm--;
+
+	// These index straight into the arrays below - a malformed OBJ would otherwise read out of
+	// bounds. The models are ours rather than a game's, but a typo shouldn't be a memory error.
+	if (vert < 0 || (size_t)vert >= verts.size()
+	    || uv < 0 || (size_t)uv >= uvs.size()
+	    || norm < 0 || (size_t)norm >= normals.size()) {
+		string err = "Face spec out of range: " + s;
+		OOVR_ABORT(err.c_str());
+	}
 
 	// Build the result
 	OOVR_RenderModel_Vertex_t out{};
@@ -264,9 +275,20 @@ EVRRenderModelError BaseRenderModels::LoadRenderModel_Async(const char* pchRende
 		vertexData_arr[i].rfTextureCoord[1] = vertexData[i].rfTextureCoord[1];
 	}
 
+	// The index type is uint16_t, so a model with more vertices than that can't be represented at
+	// all. Reject it rather than wrapping - the loop counter used to be uint16_t too, which turned
+	// this into an infinite loop writing off the end of the buffer.
+	if (rm.unVertexCount > UINT16_MAX) {
+		OOVR_LOGF("Render model has %u vertices, more than the uint16 index buffer can address", rm.unVertexCount);
+		delete[] vertexData_arr;
+		delete *renderModel;
+		*renderModel = nullptr;
+		return VRRenderModelError_TooManyVertices;
+	}
+
 	uint16_t* indexData = new uint16_t[rm.unVertexCount];
-	for (uint16_t i = 0; i < rm.unVertexCount; i++) {
-		indexData[i] = i;
+	for (uint32_t i = 0; i < rm.unVertexCount; i++) {
+		indexData[i] = (uint16_t)i;
 	}
 	rm.rIndexData = indexData;
 	rm.unTriangleCount = rm.unVertexCount / 3;
@@ -279,8 +301,10 @@ EVRRenderModelError BaseRenderModels::LoadRenderModel_Async(const char* pchRende
 
 void BaseRenderModels::FreeRenderModel(RenderModel_t* renderModel)
 {
-	delete renderModel->rVertexData;
-	delete renderModel->rIndexData;
+	// Both were allocated with new[] in LoadRenderModel_Async - plain delete on an array
+	// allocation is undefined behaviour, and games call this every time they free a model.
+	delete[] renderModel->rVertexData;
+	delete[] renderModel->rIndexData;
 	delete renderModel;
 }
 
@@ -306,7 +330,8 @@ EVRRenderModelError BaseRenderModels::LoadTexture_Async(TextureID_t textureId, R
 
 void BaseRenderModels::FreeTexture(RenderModel_TextureMap_t* texture)
 {
-	delete texture->rubTextureMapData;
+	// Allocated with new[] in LoadTexture_Async - see the note in FreeRenderModel.
+	delete[] texture->rubTextureMapData;
 	delete texture;
 }
 
@@ -389,15 +414,21 @@ uint32_t BaseRenderModels::GetRenderModelName(uint32_t unRenderModelIndex, VR_OU
 	switch (unRenderModelIndex) {
 	case 0:
 		renderModelName = "renderLeftHand";
-		strLen = strlen(renderModelName);
+		// OpenVR expects the null-inclusive length here, matching what every other
+		// string-returning function in this file does.
+		strLen = (uint32_t)strlen(renderModelName) + 1;
 		break;
 	case 1:
 		renderModelName = "renderRightHand";
-		strLen = strlen(renderModelName);
+		// OpenVR expects the null-inclusive length here, matching what every other
+		// string-returning function in this file does.
+		strLen = (uint32_t)strlen(renderModelName) + 1;
 		break;
 	case 2:
 		renderModelName = "vive_tracker";
-		strLen = strlen(renderModelName);
+		// OpenVR expects the null-inclusive length here, matching what every other
+		// string-returning function in this file does.
+		strLen = (uint32_t)strlen(renderModelName) + 1;
 		break;
 	default:
 		break;
@@ -566,7 +597,10 @@ bool BaseRenderModels::GetComponentState(const char* pchRenderModelName, const c
 
 bool BaseRenderModels::TryGetComponentState(ITrackedDevice::TrackedDeviceType hand, const std::string& componentName, OOVR_RenderModel_ComponentState_t* result)
 {
-	if (hand == ITrackedDevice::HAND_NONE)
+	// GetDeviceByHand only understands the two hands - anything else (notably GENERIC_TRACKER, which
+	// the "vive_tracker" render model maps to) trips an OOVR_SOFT_ABORT inside it. Fall through to
+	// the caller's identity-component path instead of logging a spurious error.
+	if (hand != ITrackedDevice::HAND_LEFT && hand != ITrackedDevice::HAND_RIGHT)
 		return false;
 
 	std::shared_ptr<ITrackedDevice> dev = BackendManager::Instance().GetDeviceByHand(hand);

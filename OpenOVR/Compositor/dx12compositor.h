@@ -15,12 +15,12 @@ public:
 	void InvokeCubemap(const vr::Texture_t* textures) override;
 	virtual bool SupportsCubemap() override { return false; }
 
-	ComPtr<ID3D12Device> GetDevice() { return device; }
+	// DX12 copies with CopyResource/CopyTextureRegion - there is no shader blit here, so an
+	// inverted submission can't be flipped during the copy. See Compositor::Invoke.
+	virtual bool SupportsShaderInvert() override { return false; }
 
 private:
 	void CheckCreateSwapChain(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, bool cube);
-
-	void ThrowIfFailed(HRESULT test);
 
 	bool CheckChainCompatible(D3D12_RESOURCE_DESC& inputDesc, vr::EColorSpace colourSpace);
 

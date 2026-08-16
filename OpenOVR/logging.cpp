@@ -305,6 +305,28 @@ void oovr_log_raw_format(const char* file, long line, const char* func, const ch
 	va_end(args);
 }
 
+void oovr_strcpy_trunc(char* dest, size_t destSize, const char* src, const char* what)
+{
+	if (!dest || destSize == 0)
+		return;
+
+	if (!src) {
+		dest[0] = '\0';
+		return;
+	}
+
+	const size_t len = strlen(src);
+	if (len < destSize) {
+		memcpy(dest, src, len + 1);
+		return;
+	}
+
+	memcpy(dest, src, destSize - 1);
+	dest[destSize - 1] = '\0';
+	OOVR_LOGF("WARNING: %s '%s' is %zu chars and was truncated to %zu to fit",
+	    what ? what : "string", src, len, destSize - 1);
+}
+
 OC_NORETURN void oovr_abort_raw(const char* file, long line, const char* func, const char* msg, const char* title, ...)
 {
 	va_list args;
@@ -332,7 +354,12 @@ OC_NORETURN void oovr_abort_raw_va(const char* file, long line, const char* func
 #ifdef ANDROID
 	__android_log_print(ANDROID_LOG_ERROR, "OpenComposite", "ERROR: %s:%d \t %s", func, line, buff);
 #else
-	stream << std::flush;
+	{
+		// Touching the stream without the lock is exactly the race the mutex was added for - see
+		// the comment on log_mutex. Recursive, so the OOVR_LOG calls above are fine.
+		std::lock_guard<std::recursive_mutex> lock(log_mutex);
+		stream << std::flush;
+	}
 #endif
 
 	OOVR_MESSAGE(buff, title);
@@ -345,7 +372,9 @@ void oovr_soft_abort_raw(const char* file, long line, const char* func, int* cou
 {
 	// If this has been hit already, just ignore it - if we needed a crash that would've been done.
 	if (*count > 0) {
-		count++;
+		// Was `count++`, which incremented the pointer and did nothing. The guard works either way
+		// because the tail of this function sets *count = 1, but keep an honest hit count.
+		(*count)++;
 		return;
 	}
 

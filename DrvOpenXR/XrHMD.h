@@ -22,6 +22,26 @@ class XrHMD : public XrTrackedDevice, public IHMD {
 	const InteractionProfile* profile = nullptr;
 	std::shared_mutex profile_mutex;
 
+	// Last-known-good view data, used when xrLocateViews hasn't produced valid poses yet or hiccups
+	// mid-session. These used to be function-local statics written without any synchronisation -
+	// games call GetEyeToHeadTransform and GetIPD from whatever thread they like.
+	//
+	// Keeping the last good value also means a transient runtime failure no longer kills the game:
+	// the call sites used to OOVR_FALSE_ABORT on a short viewCount.
+	std::mutex cachedViewMutex;
+	XrTime cachedViewTime = ~0; // Not zero, or we'd return an identity matrix before the first frame
+	XrView cachedEyeViews[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+	// 64mm is roughly the average human IPD - note this is in metres, so 0.064 and not 0.0064.
+	float cachedIpd = 0.064f;
+	bool haveCachedProjection = false;
+	XrFovf cachedFov[XruEyeCount] = {};
+
+	/**
+	 * The FOV for an eye, refreshed from the runtime if it is answering and falling back to the
+	 * last known-good values if it isn't.
+	 */
+	XrFovf GetCachedFov(vr::EVREye eEye);
+
 public:
 	// Override the GetPose implementation to use the difference between spaces, in the hope it'll make the
 	// head positioning possibly more accurate.

@@ -33,6 +33,17 @@ public:
 	virtual void InvokeCubemap(const vr::Texture_t* textures) = 0;
 	virtual bool SupportsCubemap() { return false; }
 
+	/**
+	 * Whether this backend can actually flip the image during the copy when invertUsingShaders is
+	 * enabled, i.e. whether it has a shader blit path rather than a plain resource copy.
+	 *
+	 * Backends that can't must return false, so Invoke falls back to letting the runtime handle the
+	 * flip via the layer's imageRect. DX12 in particular is copy-only - it used to take the bounds
+	 * and do an un-flipped region copy while also skipping the imageRect path, so the image came
+	 * out upside down.
+	 */
+	virtual bool SupportsShaderInvert() { return false; }
+
 	virtual XrSwapchain GetSwapChain() { return chain; };
 
 	virtual XrExtent2Di GetSrcSize() { return { static_cast<int32_t>(createInfo.width), static_cast<int32_t>(createInfo.height) }; }
@@ -54,5 +65,10 @@ protected:
 
 	// The format specified by the game when creating the swapchain. This is used for verifying the format hasn't changed, since
 	// we do fiddle with it a bit to get the SRGB stuff done correctly.
-	int64_t createInfoFormat;
+	int64_t createInfoFormat = 0;
+
+	// The colour space the game submitted with when the current swapchain was built. The chain's
+	// format is derived from this as well as the source format, so a game that changes it without
+	// changing anything else would otherwise keep a wrong-gamma chain for the rest of the session.
+	vr::EColorSpace createInfoColourSpace = vr::ColorSpace_Auto;
 };

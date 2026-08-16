@@ -14,12 +14,13 @@ public:
 	virtual void InvokeCubemap(const vr::Texture_t* textures) override;
 	virtual bool SupportsCubemap() override { return true; }
 
+	// DX11 has the shader blit path in CopyToSwapchain that actually performs the flip.
+	virtual bool SupportsShaderInvert() override { return true; }
+
 	ID3D11Device* GetDevice() { return device; }
 
 protected:
 	void CheckCreateSwapChain(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, bool cube);
-
-	void ThrowIfFailed(HRESULT test);
 
 	bool CheckChainCompatible(D3D11_TEXTURE2D_DESC& inputDesc, vr::EColorSpace colourSpace);
 

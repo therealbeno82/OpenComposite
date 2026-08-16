@@ -254,7 +254,9 @@ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
 
 			D3D12TextureData_t* d3dTexData = (D3D12TextureData_t*)tex->handle;
 			ComPtr<ID3D12Device> device;
-			d3dTexData->m_pResource->GetDevice(IID_PPV_ARGS(&device));
+			// A null device here would go straight into the graphics binding and fail inside the
+			// runtime with a much less useful message.
+			OOVR_FAILED_DX_ABORT(d3dTexData->m_pResource->GetDevice(IID_PPV_ARGS(&device)));
 
 			XrGraphicsBindingD3D12KHR d3dInfo{};
 			d3dInfo.type = XR_TYPE_GRAPHICS_BINDING_D3D12_KHR;
@@ -263,11 +265,14 @@ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
 			graphicsBinding = std::make_unique<BindingWrapper<XrGraphicsBindingD3D12KHR>>(d3dInfo);
 			DrvOpenXR::SetupSession();
 
-#ifdef _DEBUG
-			ComPtr<ID3D12Debug> debugController;
-			D3D12GetDebugInterface(IID_PPV_ARGS(&debugController));
-			debugController->EnableDebugLayer();
-#endif
+			// Note: there used to be a D3D12GetDebugInterface/EnableDebugLayer call here under
+			// _DEBUG. It was removed for two reasons: D3D12GetDebugInterface fails with
+			// DXGI_ERROR_SDK_COMPONENT_MISSING on any machine without the Windows "Graphics Tools"
+			// optional feature, and the unchecked result was then null-dereferenced; and it ran
+			// after the game had already created its device, so EnableDebugLayer was a no-op even
+			// when it succeeded. The debug layer has to be enabled before device creation, which
+			// OpenComposite is never in a position to do - use the DirectX Control Panel or
+			// d3dconfig to force it on for the game's executable instead.
 
 			// Note: device is a ComPtr, it releases itself - don't call Release here.
 #else
@@ -419,9 +424,10 @@ void XrBackend::ReportFrameTimings()
 	auto lock = xr_session.lock_shared();
 
 	const float threshold = oovr_global_configuration.HitchWarningMs();
+	const uint32_t summaryInterval = oovr_global_configuration.FrameTimingSummaryFrames();
 
 	// frameStartTime is default-constructed until the first frame begins - nothing to report yet.
-	if (threshold <= 0.0f || frameStartTime == std::chrono::steady_clock::time_point{}) {
+	if (frameStartTime == std::chrono::steady_clock::time_point{} || (threshold <= 0.0f && summaryInterval == 0)) {
 		frameTimings = {};
 		return;
 	}
@@ -430,7 +436,29 @@ void XrBackend::ReportFrameTimings()
 	    std::chrono::steady_clock::now() - frameStartTime)
 	                           .count();
 
-	if (totalMs >= threshold) {
+	if (summaryInterval > 0) {
+		if (framesSummarised == 0) {
+			summaryStartTime = frameStartTime;
+			frameTotalMinMs = totalMs;
+			frameTotalMaxMs = totalMs;
+		} else {
+			frameTotalMinMs = std::min(frameTotalMinMs, totalMs);
+			frameTotalMaxMs = std::max(frameTotalMaxMs, totalMs);
+		}
+
+		frameTimingSum.waitFrameMs += frameTimings.waitFrameMs;
+		frameTimingSum.beginFrameMs += frameTimings.beginFrameMs;
+		frameTimingSum.locateViewsMs += frameTimings.locateViewsMs;
+		frameTimingSum.compositorMs += frameTimings.compositorMs;
+		frameTimingSum.endFrameMs += frameTimings.endFrameMs;
+		frameTotalSumMs += totalMs;
+		framesSummarised++;
+
+		if (framesSummarised >= summaryInterval)
+			LogFrameTimingSummary();
+	}
+
+	if (threshold > 0.0f && totalMs >= threshold) {
 		const FrameTimings& t = frameTimings;
 
 		// A run where *every* frame busts the threshold would otherwise write a line per frame for
@@ -458,6 +486,55 @@ void XrBackend::ReportFrameTimings()
 	frameTimings = {};
 }
 
+void XrBackend::LogFrameTimingSummary()
+{
+	if (framesSummarised == 0)
+		return;
+
+	const double n = (double)framesSummarised;
+	const double avgTotal = frameTotalSumMs / n;
+	const double avgWait = frameTimingSum.waitFrameMs / n;
+	const double avgBegin = frameTimingSum.beginFrameMs / n;
+	const double avgLocate = frameTimingSum.locateViewsMs / n;
+	const double avgComp = frameTimingSum.compositorMs / n;
+	const double avgEnd = frameTimingSum.endFrameMs / n;
+
+	// Whatever isn't in one of our phases was spent in the game's own rendering. Note this is wall
+	// time between our SubmitFrames returning and the next WaitGetPoses, so it includes the game's
+	// GPU work - a starved GPU lands here too.
+	const double avgGame = avgTotal - (avgWait + avgBegin + avgLocate + avgComp + avgEnd);
+
+	// Measured over wall time rather than 1000/avgTotal, so periods where the game stopped calling
+	// WaitGetPoses entirely (track loads) are reflected honestly.
+	const double windowMs = std::chrono::duration<double, std::milli>(
+	    std::chrono::steady_clock::now() - summaryStartTime)
+	                            .count();
+	const double fps = windowMs > 0.0 ? (n * 1000.0) / windowMs : 0.0;
+
+	// The ratio of our frame rate to the display's is the single most useful number here. A value
+	// near 0.5 means the app is running at exactly half refresh - which is what a runtime-side
+	// half-rate lock (Virtual Desktop's Synchronous SpaceWarp, SteamVR's motion smoothing) looks
+	// like, and is quite different from simply being slow, which gives a ragged ratio.
+	const float displayHz = xr_gbl ? xr_gbl->GetDisplayFrequency(0.0f) : 0.0f;
+	const double refreshRatio = displayHz > 0.0f ? fps / displayHz : 0.0;
+
+	// Frames that were measured but never reached xrEndFrame (the session was inactive, or the
+	// runtime refused the frame) don't advance nFrameIndex, so the window can cover more frames
+	// than the counter moved - don't let the subtraction wrap.
+	const uint32_t windowStart = nFrameIndex >= framesSummarised ? nFrameIndex - framesSummarised : 0;
+
+	OOVR_LOGF("FRAMES %u-%u: %.1f fps of %.1fHz (%.2fx) | avg %.2fms (min %.2f max %.2f) | xrWaitFrame %.2f | xrBeginFrame %.2f | locateViews %.2f | compositor %.2f | xrEndFrame %.2f | game %.2f",
+	    windowStart, nFrameIndex, fps, displayHz, refreshRatio,
+	    avgTotal, frameTotalMinMs, frameTotalMaxMs,
+	    avgWait, avgBegin, avgLocate, avgComp, avgEnd, avgGame);
+
+	frameTimingSum = {};
+	frameTotalSumMs = 0.0;
+	frameTotalMinMs = 0.0;
+	frameTotalMaxMs = 0.0;
+	framesSummarised = 0;
+}
+
 void XrBackend::WaitForTrackingData()
 {
 	// Events may make the session active/inactive or trigger a restart (e.g. a graphics-API switch).
@@ -480,6 +557,12 @@ void XrBackend::WaitForTrackingData()
 		// that never happened.
 		frameTimings = {};
 		frameStartTime = {};
+
+		// Same reasoning for the rolling average - its fps figure is frames over wall time, so an
+		// inactive gap inside the window would read as a huge framerate drop that didn't happen.
+		frameTimingSum = {};
+		frameTotalSumMs = 0.0;
+		framesSummarised = 0;
 		return;
 	}
 
@@ -511,6 +594,7 @@ void XrBackend::WaitForTrackingData()
 		frameTimings.waitFrameMs = std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
 
 		xr_gbl->nextPredictedFrameTime = state.predictedDisplayTime;
+		xr_gbl->predictedDisplayPeriod = state.predictedDisplayPeriod;
 
 		// FIXME loop until this returns true?
 		// OOVR_FALSE_ABORT(state.shouldRender);
@@ -802,11 +886,14 @@ bool XrBackend::GetFrameTiming(OOVR_Compositor_FrameTiming* pTiming, uint32_t un
 		return false;
 	}
 
-	// We only keep data for the most recent frame, so a request for anything older has nothing to
-	// return - failing is more honest than reporting current-frame data as if it were that frame's.
+	// We only keep data for the most recent frame. OpenVR documents the behaviour for this case as
+	// "Sets oldest timing info if nFramesAgo is larger than the stored history" - i.e. clamp, not
+	// fail - so hand back the single record we have.
+	//
+	// This previously returned false. F1 25 asks for 5 frames ago and so got nothing at all, which
+	// is not what the API promises.
 	if (unFramesAgo > 0) {
-		OOVR_LOG_ONCEF("WARNING: Application requested frame timing %u frames ago, but only the latest frame is available", unFramesAgo);
-		return false;
+		OOVR_LOG_ONCEF("Application requested frame timing %u frames ago; only the latest frame is kept, returning that", unFramesAgo);
 	}
 
 	if (pTiming->m_nSize < sizeof(pTiming->m_nSize) || pTiming->m_nSize > maxPlausibleTimingSize) {
@@ -844,7 +931,11 @@ bool XrBackend::GetFrameTiming(OOVR_Compositor_FrameTiming* pTiming, uint32_t un
 		pTiming->m_flCompositorIdleCpuMs = 0.1f;
 
 		/** Miscellaneous measured intervals. */
-		pTiming->m_flClientFrameIntervalMs = 11.1f; // time between calls to WaitGetPoses
+		// Time between calls to WaitGetPoses. Derived from the runtime's display period rather
+		// than the old hardcoded 11.1ms (i.e. 90Hz), which was wrong at every other refresh rate.
+		pTiming->m_flClientFrameIntervalMs = xr_gbl && xr_gbl->predictedDisplayPeriod > 0
+		    ? (float)(xr_gbl->predictedDisplayPeriod / 1.0e6)
+		    : 11.1f;
 		pTiming->m_flPresentCallCpuMs = 0.0f; // time blocked on call to present (usually 0.0, but can go long)
 		pTiming->m_flWaitForPresentCpuMs = 0.0f; // time spent spin-waiting for frame index to change (not near-zero indicates wait object failure)
 		pTiming->m_flSubmitFrameMs = 0.0f; // time spent in IVRCompositor::Submit (not near-zero indicates driver issue)
@@ -1065,6 +1156,12 @@ void XrBackend::PrepareForSessionShutdown()
 	}
 	skybox_compositor.reset();
 	overlay_compositors.clear();
+
+	// The hand trackers belong to the session that's about to go away - destroy them now, while
+	// that's still legal, rather than leaving dangling handles behind for the next session.
+	if (BaseInput* input = GetUnsafeBaseInput())
+		input->ReleaseSessionHandles();
+
 	if (infoSet != XR_NULL_HANDLE) {
 		OOVR_FAILED_XR_ABORT(xrDestroyActionSet(infoSet));
 		infoSet = XR_NULL_HANDLE;

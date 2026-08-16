@@ -237,8 +237,10 @@ void VkCompositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRTex
 		region.srcSubresource.baseArrayLayer = arrayLayer;
 		region.srcSubresource.layerCount = 1;
 		// Bounds may be inverted (vMin > vMax) to request a flip - srcOffsets must be ordered
-		// (min first), or the blit has a negative source extent and violates the VUIDs. The flip
-		// itself is handled by the runtime via the layer's imageRect.
+		// (min first), or the blit has a negative source extent and violates the VUIDs. Note this
+		// drops the flip: OpenXR has no way to express one in imageRect, contrary to what this
+		// comment used to claim. vkCmdBlitImage could do it by swapping the *dst* offsets instead,
+		// which is the proper fix if a Vulkan title ever turns out to need it.
 		const float uMin = std::min(bounds->uMin, bounds->uMax);
 		const float uMax = std::max(bounds->uMin, bounds->uMax);
 		const float vMin = std::min(bounds->vMin, bounds->vMax);

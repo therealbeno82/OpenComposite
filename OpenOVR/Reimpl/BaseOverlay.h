@@ -3,6 +3,7 @@
 #include "../Misc/Keyboard/VRKeyboard.h" // TODO don't import from OCOVR, and remove the "../"
 #include <map>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <set>
 #include <vector>
@@ -163,6 +164,22 @@ private:
 	typedef OOVR_VRMessageOverlayResponse VRMessageOverlayResponse;
 
 	class OverlayData;
+
+	/**
+	 * Guards the two containers below.
+	 *
+	 * _BuildLayers iterates `overlays` from the render thread (XrBackend::SubmitFrames) while a
+	 * game is free to call CreateOverlay/DestroyOverlay from its own thread - erasing from a
+	 * std::map mid-iteration is a use-after-free.
+	 *
+	 * Note this covers the *containers*, not each OverlayData's fields; a game racing
+	 * SetOverlayTexture against a frame still gets a torn read of that overlay's own state, which
+	 * is the same thing SteamVR would give it.
+	 *
+	 * Recursive because several of the public methods call each other (HideKeyboard from
+	 * _BuildLayers, for instance).
+	 */
+	std::recursive_mutex overlaysMutex;
 
 	// Name-to-overlay mapping
 	std::map<std::string, OverlayData*> overlays;

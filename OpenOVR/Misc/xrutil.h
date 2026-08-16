@@ -50,15 +50,34 @@ class XrSessionGlobals {
 public:
 	XrSessionGlobals();
 
-	XrSpace floorSpace;
-	XrSpace seatedSpace;
-	XrSpace viewSpace;
+	XrSpace floorSpace = XR_NULL_HANDLE;
+	XrSpace seatedSpace = XR_NULL_HANDLE;
+	XrSpace viewSpace = XR_NULL_HANDLE;
 
 	XrSystemProperties systemProperties = { XR_TYPE_SYSTEM_PROPERTIES };
 	XrSystemHandTrackingPropertiesEXT handTrackingProperties = { XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT };
 
 	// Set by XrBackend
 	XrTime nextPredictedFrameTime = 1;
+
+	/**
+	 * The runtime's current display period in nanoseconds, from XrFrameState::predictedDisplayPeriod.
+	 * Zero until the first xrWaitFrame completes.
+	 *
+	 * This is the only place the real refresh rate is available - OpenVR properties like
+	 * Prop_DisplayFrequency_Float used to be hardcoded to 90Hz, which is wrong on every Quest
+	 * refresh setting except one.
+	 */
+	XrDuration predictedDisplayPeriod = 0;
+
+	/**
+	 * The display refresh in Hz, or the supplied fallback if it can't be determined yet.
+	 *
+	 * Prefers XR_FB_display_refresh_rate, which answers as soon as the session exists. The
+	 * predictedDisplayPeriod path only works once a frame has completed, which is too late for
+	 * games that query Prop_DisplayFrequency_Float during startup.
+	 */
+	float GetDisplayFrequency(float fallback = 90.0f) const;
 
 	/**
 	 * The latest time we've observed from the runtime. This will be set before a frame is submitted, so for
@@ -94,8 +113,13 @@ public:
 private:
 	/**
 	 * Makes sure calls involving the cached views map are guarded, since maps are not thread-safe.
+	 *
+	 * Shared so the common case - a cache hit, several times per frame - doesn't serialise. Note
+	 * that GetCachedViews takes this *exclusively* to insert on a miss: games call into
+	 * XrHMD::GetProjectionMatrix and friends from whatever thread they like, so an insert under a
+	 * shared lock is a genuine race, not a theoretical one.
 	 */
-	std::mutex cachedViewsMtx{};
+	std::shared_mutex cachedViewsMtx{};
 
 	std::unordered_map<XrSpace, XruCachedViews> cachedViews{};
 };

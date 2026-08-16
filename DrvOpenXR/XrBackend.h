@@ -164,11 +164,32 @@ private:
 	std::chrono::steady_clock::time_point frameStartTime;
 	uint32_t hitchCount = 0;
 
+	// --- Rolling frame-timing summary -----------------------------------------------------------
+	//
+	// The watchdog above only fires on frames that bust the threshold, so the steady-state frame -
+	// the one that actually sets your framerate - never appears in the log. These accumulate every
+	// frame and get averaged into a single line every Config::FrameTimingSummaryFrames() frames.
+	//
+	// This is what distinguishes "the runtime is pacing us" (time in xrWaitFrame) from "our copy
+	// path is slow" (time in compositor) from "the game's own rendering is slow" (the remainder).
+	FrameTimings frameTimingSum;
+	double frameTotalSumMs = 0.0;
+	double frameTotalMinMs = 0.0;
+	double frameTotalMaxMs = 0.0;
+	uint32_t framesSummarised = 0;
+	std::chrono::steady_clock::time_point summaryStartTime;
+
 	/**
-	 * Log a one-line breakdown if the frame that just ended busted the hitch threshold, then reset
-	 * the accumulator ready for the next frame.
+	 * Log a one-line breakdown if the frame that just ended busted the hitch threshold, fold it
+	 * into the rolling summary, then reset the accumulator ready for the next frame.
 	 */
 	void ReportFrameTimings();
+
+	/**
+	 * Emit the rolling average line and start a fresh window. Called by ReportFrameTimings once
+	 * enough frames have accumulated; assumes the session lock is already held.
+	 */
+	void LogFrameTimingSummary();
 
 	// Action set and action used for querying for the interaction profile
 	inline static XrActionSet infoSet = XR_NULL_HANDLE;

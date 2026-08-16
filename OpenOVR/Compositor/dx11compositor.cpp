@@ -57,14 +57,6 @@ static void XTrace(LPCSTR lpszFormat, ...)
 		throw str;                                                                                                                                     \
 	}
 
-void DX11Compositor::ThrowIfFailed(HRESULT test)
-{
-	if ((test) != S_OK) {
-		OOVR_FAILED_DX_ABORT(device->GetDeviceRemovedReason());
-		throw "ThrowIfFailed err";
-	}
-}
-
 ID3DBlob* d3d_compile_shader(const char* hlsl, const char* entrypoint, const char* target)
 {
 	DWORD flags = D3DCOMPILE_PACK_MATRIX_COLUMN_MAJOR | D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_WARNINGS_ARE_ERRORS;
@@ -252,8 +244,9 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 			OOVR_ABORTF("Invalid DXGI target format found: useLinear=%d type=DXGI_FORMAT_UNKNOWN fmt=%d", useLinearFormat, srcDesc.Format);
 		}
 
-		// Set aside the old format and sample count for checking later
+		// Set aside the old format, colour space and sample count for checking later
 		createInfoFormat = srcDesc.Format;
+		createInfoColourSpace = texture->eColorSpace;
 		createInfoSampleCount = srcDesc.SampleDesc.Count;
 
 		// Make eye render buffer
@@ -282,6 +275,8 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 		    imagesHandles.size(), &imageCount, (XrSwapchainImageBaseHeader*)imagesHandles.data()));
 
 		OOVR_FALSE_ABORT(imageCount == imagesHandles.size());
+
+		OOVR_LOGF("Swapchain image count: %u", imageCount);
 
 		swapchain_rtvs.resize(imageCount, nullptr);
 
@@ -575,6 +570,12 @@ bool DX11Compositor::CheckChainCompatible(D3D11_TEXTURE2D_DESC& inputDesc, vr::E
 		FAIL("Format");
 	}
 
+	// The chain's format is picked from the colour space as well as the source format, so this has
+	// to force a rebuild too - it used to be an unused parameter.
+	if (colourSpace != createInfoColourSpace) {
+		FAIL("ColorSpace");
+	}
+
 	// The swapchain images are always single-sampled; when the source is multisampled we allocate a
 	// matching set of resolve textures. If the app changes its sample count without changing anything
 	// else we'd otherwise keep the old chain and index into an empty resolvedMSAATextures.
@@ -611,6 +612,15 @@ bool DX11Compositor::GetFormatInfo(DXGI_FORMAT format, DX11Compositor::DxgiForma
 	case linear:                                  \
 		DEF_FMT_BASE(DXGI_FORMAT_UNKNOWN, linear, DXGI_FORMAT_UNKNOWN, bpp, bpc, channels)
 
+#define DEF_FMT_FLOAT(name, bpp, bpc, channels) \
+	case name##_TYPELESS:                       \
+	case name##_FLOAT:                          \
+		DEF_FMT_BASE(name##_TYPELESS, name##_FLOAT, DXGI_FORMAT_UNKNOWN, bpp, bpc, channels)
+
+#define DEF_FMT_FLOAT_ONLY(name, bpp, bpc, channels) \
+	case name##_FLOAT:                              \
+		DEF_FMT_BASE(DXGI_FORMAT_UNKNOWN, name##_FLOAT, DXGI_FORMAT_UNKNOWN, bpp, bpc, channels)
+
 	// Note that this *should* have pretty much all the types we'll ever see in games
 	// Filtering out the non-typeless and non-unorm/srgb types, this is all we're left with
 	// (note that types that are only typeless and don't have unorm/srgb variants are dropped too)
@@ -623,6 +633,15 @@ bool DX11Compositor::GetFormatInfo(DXGI_FORMAT format, DX11Compositor::DxgiForma
 		// Some larger linear-only types
 		DEF_FMT_NOSRGB(DXGI_FORMAT_R16G16B16A16, 64, 16, 4)
 		DEF_FMT_NOSRGB(DXGI_FORMAT_R10G10B10A2, 32, 10, 4)
+
+		// HDR float types (linear only) - DX11 games doing HDR pipelines submit these directly.
+		// R16G16B16A16's typeless variant is already covered by DEF_FMT_NOSRGB above.
+		DEF_FMT_FLOAT(DXGI_FORMAT_R32G32B32A32, 128, 32, 4)
+		DEF_FMT_FLOAT(DXGI_FORMAT_R32G32B32, 96, 32, 3)
+		DEF_FMT_FLOAT_ONLY(DXGI_FORMAT_R16G16B16A16, 64, 16, 4)
+		// R11G11B10 has no typeless variant
+	case DXGI_FORMAT_R11G11B10_FLOAT:
+		DEF_FMT_BASE(DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_UNKNOWN, 32, 11, 3)
 
 		// A jumble of other weird types
 		DEF_FMT_UNORM(DXGI_FORMAT_B5G6R5_UNORM, 16, 5, 3)
@@ -638,6 +657,8 @@ bool DX11Compositor::GetFormatInfo(DXGI_FORMAT format, DX11Compositor::DxgiForma
 
 #undef DEF_FMT
 #undef DEF_FMT_NOSRGB
+#undef DEF_FMT_FLOAT
+#undef DEF_FMT_FLOAT_ONLY
 #undef DEF_FMT_BASE
 #undef DEF_FMT_UNORM
 }

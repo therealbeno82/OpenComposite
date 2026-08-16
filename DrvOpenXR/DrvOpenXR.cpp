@@ -32,7 +32,8 @@ static bool initialised = false;
 std::string GetExeName()
 {
 	char exePath[MAX_PATH + 1] = { 0 };
-	DWORD len = GetModuleFileNameA(NULL, exePath, MAX_PATH);
+	if (GetModuleFileNameA(NULL, exePath, MAX_PATH) == 0)
+		return {};
 	PathStripPathA(exePath);
 	return { exePath };
 }
@@ -137,7 +138,8 @@ static void handleStartupInfo(const char* startupInfo)
 	Json::Value root;
 	std::string errs;
 	if (!reader->parse(info.data(), info.data() + info.size(), &root, &errs)) {
-		OOVR_LOGF("WARNING: Failed to parse startupInfo: %s (%c)", errs.c_str(), errs.back());
+		// errs.back() on an empty string is UB, and the trailing (%c) was leftover debugging.
+		OOVR_LOGF("WARNING: Failed to parse startupInfo: %s", errs.c_str());
 		return;
 	}
 
@@ -264,6 +266,13 @@ IBackend* DrvOpenXR::CreateOpenXRBackend(const char* startupInfo)
 
 	if (availableExtensions.contains(XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME))
 		extensions.push_back(XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME);
+
+	// Lets us answer Prop_DisplayFrequency_Float with the truth. Deriving the refresh from
+	// XrFrameState::predictedDisplayPeriod only works once a frame has completed, and games ask
+	// for this during startup - F1 25 asks exactly once, before the first frame, and it is the
+	// only tracked-device property it ever requests.
+	if (availableExtensions.count(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
+		extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
 
 	const char* const layers[] = {
 #ifdef XR_VALIDATION_LAYER_PATH
@@ -414,6 +423,12 @@ void DrvOpenXR::SetupSession()
 	// Print the current version for diagnostic purposes
 	OOVR_LOGF("Started OpenXR session on runtime '%s', hand tracking supported: %d",
 	    xr_gbl->systemProperties.systemName, xr_gbl->handTrackingProperties.supportsHandTracking);
+
+	// This is what games get from Prop_DisplayFrequency_Float, and it used to be a hardcoded 90.
+	// Log it so a wrong value is obvious rather than silently mis-pacing the game.
+	OOVR_LOGF("[startup] Display refresh rate: %.1f Hz (from %s)",
+	    xr_gbl->GetDisplayFrequency(),
+	    xr_ext->xrGetDisplayRefreshRateFB_Available() ? "XR_FB_display_refresh_rate" : "fallback - extension unavailable");
 
 	// If required, re-setup the input system for this new session
 	BaseInput* input = GetUnsafeBaseInput();

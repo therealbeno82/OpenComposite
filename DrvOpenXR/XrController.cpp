@@ -146,6 +146,8 @@ uint32_t XrController::GetStringTrackedDeviceProperty(vr::ETrackedDeviceProperty
 		OOVR_ABORTF("Invalid controller type %d", type);
 	}
 
+#undef PROP
+
 	return XrTrackedDevice::GetStringTrackedDeviceProperty(prop, value, bufferSize, pErrorL);
 }
 
@@ -204,8 +206,9 @@ void XrController::GetPose(vr::ETrackingUniverseOrigin origin, vr::TrackedDevice
 	// TODO do something with TrackingState
 	XrSpace space = XR_NULL_HANDLE;
 
-	// Specifically use grip pose, since that's what InteractionProfile::GetGripToSteamVRTransform uses
-	GetBaseInput()->GetHandSpace(DeviceIndex(), space, false);
+	// Specifically use grip pose, since that's what InteractionProfile::GetGripToSteamVRTransform uses.
+	// Reuse the instance fetched above rather than looking it up again.
+	input->GetHandSpace(DeviceIndex(), space, false);
 
 	if (!space)
 		return;

@@ -28,6 +28,17 @@ public:
 	 */
 	float HitchWarningMs() const { return hitchWarningMs; }
 
+	/**
+	 * Log a rolling average of the per-phase frame timings every this many frames. Set to 0 to
+	 * disable.
+	 *
+	 * The hitch watchdog above only reports frames that bust its threshold, which means the
+	 * steady-state frame - the one that decides your framerate - is invisible in the log. This
+	 * fills that gap: it is one line per N frames (roughly one every 8 seconds at 60fps and the
+	 * default of 500), so it is safe to leave on during normal play.
+	 */
+	uint32_t FrameTimingSummaryFrames() const { return frameTimingSummaryFrames > 0.0f ? (uint32_t)frameTimingSummaryFrames : 0u; }
+
 private:
 	static int ini_handler(
 	    void* user, const char* section,
@@ -48,6 +59,7 @@ private:
 	float hiddenMeshVerticalScale = 1.0f;
 	bool logAllOpenVRCalls = false;
 	float hitchWarningMs = 30.0f;
+	float frameTimingSummaryFrames = 500.0f;
 };
 
 extern Config oovr_global_configuration;

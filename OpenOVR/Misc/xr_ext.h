@@ -68,6 +68,20 @@ public:
 	bool G2Controller_Available() { return supportsG2Controller; }
 	bool xrGetVisibilityMaskKHR_Available() { return pfnXrGetVisibilityMaskKHR != nullptr; }
 	bool xrMndxXdevSpace_Available() { return pfnxrCreateXDevSpaceMNDX != nullptr; }
+	bool xrGetDisplayRefreshRateFB_Available() { return pfnXrGetDisplayRefreshRateFB != nullptr; }
+
+	/**
+	 * The display's current refresh rate in Hz.
+	 *
+	 * Unlike deriving it from XrFrameState::predictedDisplayPeriod, this works as soon as the
+	 * session exists - which matters because games tend to ask for Prop_DisplayFrequency_Float
+	 * once during startup, before a single frame has been submitted.
+	 */
+	XrResult xrGetDisplayRefreshRateFB(XrSession session, float* displayRefreshRate)
+	{
+		OOVR_FALSE_ABORT(pfnXrGetDisplayRefreshRateFB);
+		return pfnXrGetDisplayRefreshRateFB(session, displayRefreshRate);
+	}
 
 	XrResult xrGetVisibilityMaskKHR(
 	    XrSession session,
@@ -219,6 +233,8 @@ private:
 	PFN_xrGetXDevPropertiesMNDX pfnxrGetXDevPropertiesMNDX = nullptr;
 	PFN_xrDestroyXDevListMNDX pfnxrDestroyXDevListMNDX = nullptr;
 	PFN_xrCreateXDevSpaceMNDX pfnxrCreateXDevSpaceMNDX = nullptr;
+
+	PFN_xrGetDisplayRefreshRateFB pfnXrGetDisplayRefreshRateFB = nullptr;
 
 	bool supportsG2Controller = false;
 
