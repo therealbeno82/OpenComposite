@@ -1,4 +1,18 @@
-**NOTE: This is a mirror of https://gitlab.com/znixian/OpenOVR. I just like using Github more.**
+> ### This is a personal modified copy
+>
+> Upstream is **https://gitlab.com/znixian/OpenOVR** — please report bugs and ask for support
+> there, not here. This copy carries local changes made while getting **F1 25** and
+> **Automobilista 2** running over VirtualDesktopXR: a batch of bug fixes (DX12 resource barriers,
+> several memory-corruption and out-of-bounds fixes, exceptions that escaped the OpenVR C ABI),
+> frame-timing instrumentation, and `IVRCompositor` frame-timing corrections.
+>
+> It is **not** a git fork — the source was dropped in and committed fresh, so it shares no history
+> with upstream and cannot be diffed against it directly. See `CLAUDE.md` for what was changed,
+> what was measured, and what is still open.
+>
+> Licensed GPLv3, same as upstream.
+
+**NOTE: The text below is upstream's README. This is a mirror of https://gitlab.com/znixian/OpenOVR. I just like using Github more.**
 
 # OpenComposite (OpenXR) - Play SteamVR games without SteamVR!
 [![Discord](https://img.shields.io/discord/499733750209314816.svg?style=for-the-badge&logo=discord&label=discord)](https://discord.gg/zYA6Tzs)
