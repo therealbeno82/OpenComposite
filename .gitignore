@@ -11,3 +11,7 @@ libs/
 *.user
 # Stray editor backups
 *.copy
+
+# Python bytecode - build artifacts, and they bake absolute source paths in
+__pycache__/
+*.pyc
