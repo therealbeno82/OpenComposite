@@ -12,6 +12,19 @@
 >
 > Licensed GPLv3, same as upstream.
 
+## Just want the DLL? You don't need to compile anything.
+
+A pre-built 64-bit DLL is in **[`release/`](release/)**, already named `openvr_api.dll` so you can
+drop it straight into a game folder.
+
+**→ [Download and installation instructions, including F1 25 step-by-step](release/README.md)**
+
+The short version: back up the game's existing `openvr_api.dll`, copy this one over it, and make
+sure your OpenXR runtime is *not* set to SteamVR. Read the linked guide before doing it — it also
+covers uninstalling, and the anti-cheat caveat for F1 25.
+
+---
+
 **NOTE: The text below is upstream's README. This is a mirror of https://gitlab.com/znixian/OpenOVR. I just like using Github more.**
 
 # OpenComposite (OpenXR) - Play SteamVR games without SteamVR!
