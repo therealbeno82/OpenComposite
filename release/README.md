@@ -124,12 +124,39 @@ if you report a problem.
 ## Optional settings (`opencomposite.ini`)
 
 Entirely optional — the defaults are fine. To change something, create a plain text file named
-`opencomposite.ini` **in the same folder as the DLL** (i.e. the game folder) containing:
+`opencomposite.ini` **in the same folder as the DLL** (i.e. the game folder), containing just the
+settings you want, one per line:
 
 ```ini
-[Config]
 supersampleRatio=1.0
+hitchWarningMs=30
 ```
+
+> **Do not put a `[Config]` heading — or any other `[...]` heading — in this file.** An earlier
+> version of this guide showed one, and it was wrong: it makes the game close immediately on
+> startup with an "OpenComposite Config File Error" box. Settings must begin at the very top of the
+> file with no heading above them. If you already made a file with `[Config]` in it, delete that
+> one line and it will work.
+
+This file is strict. Anything it doesn't understand stops the game from starting rather than being
+quietly ignored, so it's worth matching the format exactly:
+
+- **No `[...]` headings**, as above.
+- **Names are case-sensitive.** `supersampleRatio` works; `SupersampleRatio` and `supersampleratio`
+  do not.
+- **One `name=value` per line, starting hard against the left margin** — no spaces or tabs in front
+  of the name.
+- **Numeric values must be just the number.** `1.2` — not `1.2x`, not `120%`, and not `1,2` with a
+  comma.
+- **Comments go on their own line, starting with `;` or `#`.** A `#` partway along a line is *not*
+  treated as a comment and will stop the game. If you want a note after a value use `;`, with a
+  space before it: `supersampleRatio=1.2 ; sharper`.
+- **Only the names in the table below exist in this build.** Any other name — including one copied
+  from a different OpenComposite version — stops the game.
+
+If you do get that error box, it names the setting and the line number it choked on. One catch:
+with a `[Config]` heading the error points at the *setting* line, not the heading above it — the
+heading is still the thing to delete.
 
 Settings worth knowing about:
 
@@ -152,6 +179,12 @@ Settings worth knowing about:
 Three usual causes, in order of likelihood: your OpenXR runtime is set to SteamVR (fix it in
 Virtual Desktop Streamer / your runtime's settings); you copied the DLL into the wrong folder; or
 a game update replaced it. Confirm the `openvr_api.dll` in the game folder is ~2.5 MB, not ~820 KB.
+
+**The game closes instantly with an "OpenComposite Config File Error" box.**
+Your `opencomposite.ini` has a line it can't read, and the box says which. By far the most common
+cause is a `[Config]` heading at the top of the file — delete that line. See
+[Optional settings](#optional-settings-opencompositeini) for the exact format. If you didn't create
+an `opencomposite.ini`, check the game folder for one left behind by something else.
 
 **The game shows an "OpenComposite Error - info in log" box, or won't start.**
 Open `%LOCALAPPDATA%\OpenComposite\logs\opencomposite.log`. The last few lines usually name the

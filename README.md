@@ -145,7 +145,9 @@ the default values are used.
 
 This is it's configuration file, where you can specify a number of options. These are listed in `name=value` format, and you
 can define a comment by starting a line with `;` or a `#`. Note the option names **are** case sensitive. If you specify an invalid
-option, the game will immediately crash on startup. Any whitespace between the name, equals sign, and value is ignored, as is whitespace
+option, the game will immediately crash on startup. There is also no support for `[section]`
+headings - options go straight into the file with no heading above them, and adding one makes every
+option below it count as invalid. Any whitespace between the name, equals sign, and value is ignored, as is whitespace
 on the end of the line. Ensure your lines do not being with whitespace however.
 
 The available options are:
